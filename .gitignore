@@ -60,3 +60,43 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+# Xcode / iOS Build Files
+build/
+*.xcarchive
+DerivedData/
+
+# Xcode User Settings (personal IDE config)
+*.xcworkspace
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.xcscheme
+*.xcplugindata
+
+# CocoaPods (dependency manager)
+Pods/
+Podfile.lock
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# macOS / Finder files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Secrets / API keys / env files
+.env
+.env.*
+secrets.json
+Config/Secret*.swift
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~.nib
