@@ -1,21 +1,10 @@
-//
-//  ContentView.swift
-//  VisionRep
-//
-//  Created by Zheng Pan on 2026-04-29.
-//
-
 import SwiftUI
 
 struct ContentView: View {
+    @State private var session = WorkoutSessionModel()
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+        WorkoutDashboardView(model: session)
     }
 }
 

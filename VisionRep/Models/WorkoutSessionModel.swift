@@ -1,0 +1,275 @@
+@preconcurrency import AVFoundation
+import Foundation
+import Observation
+
+@MainActor
+@Observable
+final class WorkoutSessionModel {
+    enum Mode: Equatable {
+        case setup
+        case cameraReady
+        case recordingTemplate(Int)
+        case templatesReady
+        case counting
+    }
+
+    let camera = CameraFrameSource()
+
+    var cameraState: CameraState = .idle
+    var mode: Mode = .setup
+    var latestPose: PoseFrame?
+    var poseQuality = PoseQuality(trackedJointRatio: 0, requiredJointRatio: 0, averageConfidence: 0)
+    var templates: [MovementTemplate] = []
+    var activeCaptureFrameCount = 0
+    var repetitionCount = 0
+    var matchConfidence = 0.0
+    var latestMatcherScore = Double.infinity
+    var statusMessage = "Start the camera and keep your full body in frame."
+
+    @ObservationIgnored private let frameBridge = PoseProcessingBridge()
+    @ObservationIgnored private let repetitionCounter = FewShotRepetitionCounter()
+    @ObservationIgnored private let profileStore = ExerciseProfileStore()
+    @ObservationIgnored private var activeCaptureFrames: [PoseFrame] = []
+    @ObservationIgnored private var activeCaptureQualityScores: [Double] = []
+
+    init() {
+        templates = profileStore.loadTemplates()
+        repetitionCounter.load(templates: templates)
+        if !templates.isEmpty {
+            statusMessage = "Loaded \(templates.count) local templates. Start the camera to count live."
+        }
+
+        frameBridge.onResult = { [weak self] result in
+            self?.handle(result)
+        }
+        camera.frameHandler = { [frameBridge] sampleBuffer in
+            frameBridge.process(sampleBuffer)
+        }
+    }
+
+    var captureSession: AVCaptureSession {
+        camera.session
+    }
+
+    var canRecordTemplate: Bool {
+        switch mode {
+        case .cameraReady, .templatesReady:
+            // poseQuality.score >= 0.58 // blocked for initial run low accuracy needed
+            poseQuality.score >= 0.47
+        default:
+            false
+        }
+    }
+
+    var canStartCounting: Bool {
+        templates.count >= 3
+    }
+
+    var primaryActionTitle: String {
+        switch mode {
+        case .setup:
+            "Start Camera"
+        case .cameraReady, .templatesReady:
+            templates.count >= 3 ? "Count Live" : "Record Rep"
+        case .recordingTemplate:
+            "Finish Rep"
+        case .counting:
+            "Pause"
+        }
+    }
+
+    func performPrimaryAction() {
+        switch mode {
+        case .setup:
+            startCamera()
+        case .cameraReady, .templatesReady:
+            if templates.count >= 3 {
+                startCounting()
+            } else {
+                beginTemplateRecording()
+            }
+        case .recordingTemplate:
+            finishTemplateRecording()
+        case .counting:
+            pauseCounting()
+        }
+    }
+
+    func startCamera() {
+        camera.requestAccessAndConfigure { [weak self] state in
+            Task { @MainActor in
+                self?.applyCameraState(state)
+            }
+        }
+    }
+
+    func beginTemplateRecording() {
+        guard canRecordTemplate else {
+            statusMessage = poseQuality.guidance
+            return
+        }
+
+        activeCaptureFrames.removeAll(keepingCapacity: true)
+        activeCaptureQualityScores.removeAll(keepingCapacity: true)
+        activeCaptureFrameCount = 0
+        mode = .recordingTemplate(templates.count + 1)
+        statusMessage = "Perform one complete repetition, then tap Finish Rep."
+    }
+
+    func finishTemplateRecording() {
+        guard case .recordingTemplate(let index) = mode else { return }
+
+        let averageQuality = activeCaptureQualityScores.average
+        guard let template = repetitionCounter.makeTemplate(
+            index: index,
+            frames: activeCaptureFrames,
+            averageQuality: averageQuality
+        ) else {
+            activeCaptureFrames.removeAll(keepingCapacity: true)
+            activeCaptureQualityScores.removeAll(keepingCapacity: true)
+            activeCaptureFrameCount = 0
+            mode = templates.isEmpty ? .cameraReady : .templatesReady
+            statusMessage = "That rep was too short or unclear. Try one slower, full-body rep."
+            return
+        }
+
+        templates.append(template)
+        profileStore.save(templates)
+        activeCaptureFrames.removeAll(keepingCapacity: true)
+        activeCaptureQualityScores.removeAll(keepingCapacity: true)
+        activeCaptureFrameCount = 0
+        repetitionCounter.load(templates: templates)
+
+        mode = templates.count >= 3 ? .templatesReady : .cameraReady
+        statusMessage = templates.count >= 3
+            ? "Templates are calibrated. You can record up to 5 or start counting."
+            : "Template saved. Record \(3 - templates.count) more."
+    }
+
+    func recordAdditionalTemplate() {
+        guard templates.count < 5, mode == .templatesReady else { return }
+        beginTemplateRecording()
+    }
+
+    func startCounting() {
+        guard templates.count >= 3 else {
+            statusMessage = "Record at least 3 templates before live counting."
+            return
+        }
+
+        repetitionCounter.load(templates: templates)
+        repetitionCount = 0
+        matchConfidence = 0
+        latestMatcherScore = .infinity
+        mode = .counting
+        statusMessage = "Counting live. Complete the same movement path you recorded."
+    }
+
+    func pauseCounting() {
+        mode = .templatesReady
+        statusMessage = "Counting paused. Templates remain on this device."
+    }
+
+    func resetCalibration() {
+        templates.removeAll()
+        profileStore.deleteTemplates()
+        activeCaptureFrames.removeAll()
+        activeCaptureQualityScores.removeAll()
+        activeCaptureFrameCount = 0
+        repetitionCounter.load(templates: [])
+        repetitionCount = 0
+        matchConfidence = 0
+        latestMatcherScore = .infinity
+        mode = cameraState == .running ? .cameraReady : .setup
+        statusMessage = "Calibration reset. Record 3 to 5 clean reps."
+    }
+
+    private func handle(_ result: PoseProcessingResult) {
+        switch result {
+        case .pose(let displayFrame, let normalizedFrame, let quality):
+            latestPose = displayFrame
+            poseQuality = quality
+            ingest(normalizedFrame, quality: quality)
+        case .noPose:
+            latestPose = nil
+            poseQuality = PoseQuality(trackedJointRatio: 0, requiredJointRatio: 0, averageConfidence: 0)
+            statusMessage = "No body detected. Step into frame."
+        case .skipped:
+            break
+        case .failed(let message):
+            statusMessage = "Pose detection failed: \(message)"
+        }
+    }
+
+    private func applyCameraState(_ state: CameraState) {
+        cameraState = state
+
+        switch state {
+        case .idle:
+            camera.start()
+            cameraState = .running
+            mode = templates.isEmpty ? .cameraReady : .templatesReady
+            statusMessage = "Camera is live. Record 3 to 5 clean full-body reps."
+        case .configuring:
+            statusMessage = "Preparing the camera..."
+        case .needsPermission:
+            statusMessage = "Camera permission is required for on-device rep counting."
+        case .failed(let message):
+            statusMessage = message
+        case .running:
+            statusMessage = "Camera is live."
+        }
+    }
+
+    private func ingest(_ frame: PoseFrame, quality: PoseQuality) {
+        switch mode {
+        case .recordingTemplate:
+            guard quality.score >= 0.48 else {
+                statusMessage = quality.guidance
+                return
+            }
+            activeCaptureFrames.append(frame)
+            activeCaptureQualityScores.append(quality.score)
+            activeCaptureFrameCount = activeCaptureFrames.count
+        case .counting:
+            let update = repetitionCounter.update(with: frame)
+            repetitionCount = update.repetitions
+            matchConfidence = update.confidence
+            latestMatcherScore = update.bestScore
+            if update.confidence > 0.72 {
+                statusMessage = "Movement matched template \(update.matchedTemplateIndex ?? 0)."
+            } else if quality.score < 0.58 {
+                statusMessage = quality.guidance
+            } else {
+                statusMessage = "Track the full recorded movement path."
+            }
+        default:
+            if quality.score < 0.58 {
+                statusMessage = quality.guidance
+            }
+        }
+    }
+}
+
+private nonisolated final class PoseProcessingBridge: @unchecked Sendable {
+    var onResult: ((PoseProcessingResult) -> Void)?
+
+    private let processor = PoseFrameProcessor()
+
+    func process(_ sampleBuffer: CMSampleBuffer) {
+        let result = processor.process(sampleBuffer)
+        guard case .skipped = result else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onResult?(result)
+            }
+            return
+        }
+    }
+}
+
+private extension Array where Element == Double {
+    var average: Double {
+        guard !isEmpty else { return 0 }
+        return reduce(0, +) / Double(count)
+    }
+}
