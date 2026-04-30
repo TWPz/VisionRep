@@ -41,6 +41,8 @@ final class WorkoutSessionModel {
     @ObservationIgnored private var countingCountdownTask: Task<Void, Never>?
     @ObservationIgnored private var isTemplateCaptureActive = false
     @ObservationIgnored private var isLiveCountingActive = false
+    @ObservationIgnored private var poseDisplayThrottle = 0
+    @ObservationIgnored private let poseDisplayInterval = 3
 
     init() {
         templates = profileStore.loadTemplates()
@@ -251,10 +253,14 @@ final class WorkoutSessionModel {
     private func handle(_ result: PoseProcessingResult) {
         switch result {
         case .pose(let displayFrame, let normalizedFrame, let quality):
-            latestPose = displayFrame
+            poseDisplayThrottle += 1
+            if poseDisplayThrottle % poseDisplayInterval == 0 {
+                latestPose = displayFrame
+            }
             poseQuality = quality
             ingest(normalizedFrame, quality: quality)
         case .noPose:
+            poseDisplayThrottle = 0
             latestPose = nil
             poseQuality = PoseQuality(trackedJointRatio: 0, requiredJointRatio: 0, averageConfidence: 0)
             if trainingCountdownRemaining == nil, countingCountdownRemaining == nil {
