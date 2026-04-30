@@ -17,6 +17,7 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
     private let sessionQueue = DispatchQueue(label: "com.visionrep.camera.session")
     private let videoQueue = DispatchQueue(label: "com.visionrep.camera.frames", qos: .userInitiated)
     private let output = AVCaptureVideoDataOutput()
+    private let targetCameraFramesPerSecond: Double = 30
     private var isConfigured = false
 
     func requestAccessAndConfigure(completion: @escaping (CameraState) -> Void) {
@@ -132,13 +133,19 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
 
     private func preferredFrontCamera() -> AVCaptureDevice? {
         let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera],
+            deviceTypes: [.builtInUltraWideCamera, .builtInTrueDepthCamera, .builtInWideAngleCamera],
             mediaType: .video,
             position: .front
         )
 
-        return discovery.devices.first { $0.deviceType == .builtInUltraWideCamera }
-            ?? discovery.devices.first { $0.deviceType == .builtInWideAngleCamera }
+        let centerStageDevices = discovery.devices.filter { device in
+            device.formats.contains(where: \.isCenterStageSupported)
+        }
+        let candidates = centerStageDevices.isEmpty ? discovery.devices : centerStageDevices
+
+        return candidates.max { lhs, rhs in
+            widestSupportedFieldOfView(for: lhs) < widestSupportedFieldOfView(for: rhs)
+        }
     }
 
     private func configureDevice(_ device: AVCaptureDevice) throws {
@@ -147,11 +154,11 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        if let centerStageFormat = preferredCenterStageFormat(for: device) {
-            device.activeFormat = centerStageFormat
+        if let wideFormat = preferredWideFieldOfViewFormat(for: device) {
+            device.activeFormat = wideFormat
         }
 
-        let duration = CMTime(value: 1, timescale: 30)
+        let duration = CMTime(value: 1, timescale: CMTimeScale(targetCameraFramesPerSecond))
         device.activeVideoMinFrameDuration = duration
         device.activeVideoMaxFrameDuration = duration
 
@@ -165,21 +172,38 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         AVCaptureDevice.isCenterStageEnabled = true
     }
 
-    private func preferredCenterStageFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
-        let formats = device.formats.filter { format in
-            format.isCenterStageSupported && format.videoSupportedFrameRateRanges.contains { range in
-                range.minFrameRate <= 30 && range.maxFrameRate >= 30
-            }
+    private func preferredWideFieldOfViewFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let frameRateFormats = device.formats.filter { format in
+            format.supports(frameRate: targetCameraFramesPerSecond)
         }
+        let centerStageFormats = frameRateFormats.filter(\.isCenterStageSupported)
+        let candidates = centerStageFormats.isEmpty ? frameRateFormats : centerStageFormats
 
-        return formats.min { lhs, rhs in
-            formatDistanceFrom720p(lhs) < formatDistanceFrom720p(rhs)
+        return candidates.max { lhs, rhs in
+            if lhs.videoFieldOfView == rhs.videoFieldOfView {
+                return formatDistanceFrom720p(lhs) > formatDistanceFrom720p(rhs)
+            }
+            return lhs.videoFieldOfView < rhs.videoFieldOfView
         }
+    }
+
+    private func widestSupportedFieldOfView(for device: AVCaptureDevice) -> Float {
+        preferredWideFieldOfViewFormat(for: device)?.videoFieldOfView
+            ?? device.formats.map(\.videoFieldOfView).max()
+            ?? 0
     }
 
     private func formatDistanceFrom720p(_ format: AVCaptureDevice.Format) -> Int32 {
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         return abs(dimensions.width - 1280) + abs(dimensions.height - 720)
+    }
+}
+
+private extension AVCaptureDevice.Format {
+    nonisolated func supports(frameRate: Double) -> Bool {
+        videoSupportedFrameRateRanges.contains { range in
+            range.minFrameRate <= frameRate && range.maxFrameRate >= frameRate
+        }
     }
 }
 

@@ -61,6 +61,13 @@ func makeStaticFrames(from frame: PoseFrame, start: TimeInterval, frameCount: In
     }
 }
 
+func holdEndPose(after rep: [PoseFrame], count: Int) -> [PoseFrame] {
+    guard let last = rep.last else { return [] }
+    return (1...count).map { offset in
+        PoseFrame(timestamp: last.timestamp + (Double(offset) * 0.05), joints: last.joints)
+    }
+}
+
 let trainer = FewShotRepetitionCounter()
 let templates = [
     trainer.makeTemplate(index: 1, frames: makeRep(start: 0, amplitude: 10.00), averageQuality: 0.96),
@@ -75,7 +82,8 @@ counter.load(templates: templates)
 expect(counter.onlineTemplateCount == 0, "first live rep must start with no online templates")
 
 var latest = CountUpdate(repetitions: 0, confidence: 0, bestScore: .infinity, matchedTemplateIndex: nil)
-for frame in makeRep(start: 100, amplitude: 10.0) {
+let firstLiveRep = makeRep(start: 100, amplitude: 10.0)
+for frame in firstLiveRep + holdEndPose(after: firstLiveRep, count: 2) {
     latest = counter.update(with: frame)
 }
 
@@ -88,7 +96,8 @@ expect(counter.onlineTemplateCount == 1, "resetting count should preserve online
 counter.clearOnlineTemplates()
 expect(counter.onlineTemplateCount == 0, "explicit clearing should wipe online templates")
 
-for frame in makeRep(start: 200, amplitude: 10.0) {
+let secondLiveRep = makeRep(start: 200, amplitude: 10.0)
+for frame in secondLiveRep + holdEndPose(after: secondLiveRep, count: 2) {
     latest = counter.update(with: frame)
 }
 

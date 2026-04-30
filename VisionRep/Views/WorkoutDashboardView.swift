@@ -267,7 +267,8 @@ private struct SlimTrainingStatus: View {
             let voiceText = voiceCommandStatus.isEmpty ? "say stop" : voiceCommandStatus.lowercased()
             return "\(activeFrameCount) frames - \(voiceText)"
         } else {
-            return "\(completedCount)/5 reps"
+            let voiceText = voiceCommandStatus.isEmpty ? "say action" : voiceCommandStatus.lowercased()
+            return "\(completedCount)/5 reps - \(voiceText)"
         }
     }
 }

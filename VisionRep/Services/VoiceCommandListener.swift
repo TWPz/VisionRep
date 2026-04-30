@@ -3,7 +3,8 @@ import Speech
 
 @MainActor
 final class VoiceCommandListener {
-    enum Command {
+    enum Command: Hashable {
+        case action
         case stop
     }
 
@@ -13,34 +14,54 @@ final class VoiceCommandListener {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var isTapInstalled = false
-    private var didHandleStop = false
+    private var didHandleCommand = false
+    private var voiceSessionID = 0
 
     func start(
+        listeningFor allowedCommands: Set<Command>,
         onCommand: @escaping (Command) -> Void,
         onStatus: @escaping (String) -> Void
     ) {
         stop()
-        didHandleStop = false
+        voiceSessionID += 1
+        let sessionID = voiceSessionID
+        didHandleCommand = false
+
+        guard !allowedCommands.isEmpty else {
+            onStatus("")
+            return
+        }
+
         onStatus("Voice preparing")
 
         Task { [weak self] in
             guard let self else { return }
 
-            guard await Self.requestSpeechAuthorization() else {
+            let speechAuthorized = await Self.requestSpeechAuthorization()
+            guard self.voiceSessionID == sessionID else { return }
+            guard speechAuthorized else {
                 onStatus("Speech denied; tap Finish")
                 return
             }
 
-            guard await Self.requestMicrophoneAuthorization() else {
+            let microphoneAuthorized = await Self.requestMicrophoneAuthorization()
+            guard self.voiceSessionID == sessionID else { return }
+            guard microphoneAuthorized else {
                 onStatus("Mic denied; tap Finish")
                 return
             }
 
-            self.startRecognition(onCommand: onCommand, onStatus: onStatus)
+            self.startRecognition(
+                sessionID: sessionID,
+                listeningFor: allowedCommands,
+                onCommand: onCommand,
+                onStatus: onStatus
+            )
         }
     }
 
     func stop() {
+        voiceSessionID += 1
         recognitionTask?.cancel()
         recognitionTask = nil
 
@@ -60,11 +81,15 @@ final class VoiceCommandListener {
     }
 
     private func startRecognition(
+        sessionID: Int,
+        listeningFor allowedCommands: Set<Command>,
         onCommand: @escaping (Command) -> Void,
         onStatus: @escaping (String) -> Void
     ) {
+        guard voiceSessionID == sessionID else { return }
+
         guard let recognizer else {
-            onStatus("Voice unavailable; tap Finish")
+            onStatus("Voice unavailable")
             return
         }
 
@@ -98,47 +123,94 @@ final class VoiceCommandListener {
                     self?.handleRecognitionResult(
                         result,
                         error: error,
+                        sessionID: sessionID,
+                        listeningFor: allowedCommands,
                         onCommand: onCommand,
                         onStatus: onStatus
                     )
                 }
             }
 
-            onStatus("Say stop")
+            onStatus(Self.statusText(for: allowedCommands))
         } catch {
             stop()
-            onStatus("Voice failed; tap Finish")
+            onStatus("Voice failed; use button")
         }
     }
 
     private func handleRecognitionResult(
         _ result: SFSpeechRecognitionResult?,
         error: Error?,
+        sessionID: Int,
+        listeningFor allowedCommands: Set<Command>,
         onCommand: @escaping (Command) -> Void,
         onStatus: @escaping (String) -> Void
     ) {
+        guard voiceSessionID == sessionID else { return }
+
         if let result {
             let transcript = result.bestTranscription.formattedString
-            if Self.containsStopCommand(in: transcript), !didHandleStop {
-                didHandleStop = true
-                onStatus("Stop heard")
-                onCommand(.stop)
+            if let command = Self.command(in: transcript, allowedCommands: allowedCommands), !didHandleCommand {
+                didHandleCommand = true
+                onStatus(Self.heardText(for: command))
                 stop()
+                onCommand(command)
                 return
             }
         }
 
-        if error != nil, !didHandleStop {
+        if error != nil, !didHandleCommand {
             stop()
-            onStatus("Voice paused; tap Finish")
+            onStatus("Voice paused; use button")
         }
     }
 
+    private static func command(in transcript: String, allowedCommands: Set<Command>) -> Command? {
+        if allowedCommands.contains(.action), containsActionCommand(in: transcript) {
+            return .action
+        }
+
+        if allowedCommands.contains(.stop), containsStopCommand(in: transcript) {
+            return .stop
+        }
+
+        return nil
+    }
+
+    private static func containsActionCommand(in transcript: String) -> Bool {
+        commandWords(in: transcript).contains("action")
+    }
+
     private static func containsStopCommand(in transcript: String) -> Bool {
+        commandWords(in: transcript).contains("stop")
+    }
+
+    private static func commandWords(in transcript: String) -> [String] {
         let words = transcript
             .lowercased()
             .components(separatedBy: CharacterSet.letters.inverted)
-        return words.contains("stop")
+        return words
+    }
+
+    private static func statusText(for commands: Set<Command>) -> String {
+        if commands == [.action] {
+            return "Say action"
+        }
+
+        if commands == [.stop] {
+            return "Say stop"
+        }
+
+        return "Say action or stop"
+    }
+
+    private static func heardText(for command: Command) -> String {
+        switch command {
+        case .action:
+            "Action heard"
+        case .stop:
+            "Stop heard"
+        }
     }
 
     private static func requestSpeechAuthorization() async -> Bool {

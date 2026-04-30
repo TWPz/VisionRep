@@ -132,7 +132,7 @@ final class WorkoutSessionModel {
         stopCountingCountdown()
         isLiveCountingActive = false
         mode = .recordingTemplate(templates.count + 1)
-        startVoiceCommands()
+        startVoiceCommands(listeningFor: [.stop])
         startTrainingCountdown()
     }
 
@@ -153,6 +153,7 @@ final class WorkoutSessionModel {
             activeCaptureFrameCount = 0
             mode = templates.isEmpty ? .cameraReady : .templatesReady
             statusMessage = "That rep was too short or unclear. Try one slower, full-body rep."
+            refreshVoiceCommandsForCurrentMode()
             return
         }
 
@@ -166,6 +167,7 @@ final class WorkoutSessionModel {
 
         mode = templates.count >= 3 ? .templatesReady : .cameraReady
         statusMessage = trainingProgressMessage
+        refreshVoiceCommandsForCurrentMode()
     }
 
     func recordAdditionalTemplate() {
@@ -200,6 +202,7 @@ final class WorkoutSessionModel {
         repetitionCounter.clearOnlineTemplates()
         mode = .templatesReady
         statusMessage = "Counting paused. Templates remain on this device."
+        refreshVoiceCommandsForCurrentMode()
     }
 
     func resetCalibration() {
@@ -222,6 +225,7 @@ final class WorkoutSessionModel {
         countingCountdownRemaining = nil
         mode = cameraState == .running ? .cameraReady : .setup
         statusMessage = "Calibration reset. Record 3 to 5 clean reps."
+        refreshVoiceCommandsForCurrentMode()
     }
 
     private func handle(_ result: PoseProcessingResult) {
@@ -261,6 +265,8 @@ final class WorkoutSessionModel {
         case .running:
             statusMessage = "Camera is live."
         }
+
+        refreshVoiceCommandsForCurrentMode()
     }
 
     private func ingest(_ frame: PoseFrame, quality: PoseQuality) {
@@ -349,9 +355,9 @@ final class WorkoutSessionModel {
         countingCountdownRemaining = nil
     }
 
-    private func startVoiceCommands() {
+    private func startVoiceCommands(listeningFor allowedCommands: Set<VoiceCommandListener.Command>) {
         voiceCommandStatus = "Voice preparing"
-        voiceCommandListener.start { [weak self] command in
+        voiceCommandListener.start(listeningFor: allowedCommands) { [weak self] command in
             self?.handleVoiceCommand(command)
         } onStatus: { [weak self] status in
             self?.voiceCommandStatus = status
@@ -363,13 +369,43 @@ final class WorkoutSessionModel {
         voiceCommandStatus = ""
     }
 
-    private func handleVoiceCommand(_ command: VoiceCommandListener.Command) {
-        guard case .recordingTemplate = mode else {
+    private func refreshVoiceCommandsForCurrentMode() {
+        guard cameraState == .running else {
+            stopVoiceCommands()
             return
         }
 
+        switch mode {
+        case .cameraReady where templates.count < 5,
+             .templatesReady where templates.count < 5:
+            startVoiceCommands(listeningFor: [.action])
+        case .recordingTemplate:
+            startVoiceCommands(listeningFor: [.stop])
+        case .setup, .cameraReady, .templatesReady, .counting:
+            stopVoiceCommands()
+        }
+    }
+
+    private func handleVoiceCommand(_ command: VoiceCommandListener.Command) {
         switch command {
+        case .action:
+            guard templates.count < 5 else {
+                voiceCommandStatus = "Action ignored"
+                return
+            }
+
+            switch mode {
+            case .cameraReady, .templatesReady:
+                beginTemplateRecording()
+            case .setup, .recordingTemplate, .counting:
+                voiceCommandStatus = "Action ignored"
+            }
         case .stop:
+            guard case .recordingTemplate = mode else {
+                voiceCommandStatus = "Stop ignored"
+                refreshVoiceCommandsForCurrentMode()
+                return
+            }
             guard isTemplateCaptureActive else {
                 voiceCommandStatus = "Stop ignored until recording"
                 return

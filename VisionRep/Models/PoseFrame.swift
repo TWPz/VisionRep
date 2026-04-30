@@ -25,6 +25,11 @@ nonisolated struct PoseJoint: Codable, Equatable, Sendable {
     var x: Double
     var y: Double
     var confidence: Double
+    var z: Double? = nil
+
+    var hasDepth: Bool {
+        z != nil
+    }
 
     var point: CGPoint {
         CGPoint(x: x, y: y)
@@ -115,6 +120,7 @@ nonisolated enum PoseFrameFactory {
 
         let centerX = root?.x ?? [leftHip?.x, rightHip?.x].compactMap { $0 }.average
         let centerY = root?.y ?? [leftHip?.y, rightHip?.y].compactMap { $0 }.average
+        let centerZ = root?.z ?? [leftHip?.z, rightHip?.z].compactMap { $0 }.average
 
         let shoulderWidth = distance(frame.joint(.leftShoulder), frame.joint(.rightShoulder))
         let hipWidth = distance(leftHip, rightHip)
@@ -125,7 +131,8 @@ nonisolated enum PoseFrameFactory {
             PoseJoint(
                 x: (joint.x - centerX) / scale,
                 y: (joint.y - centerY) / scale,
-                confidence: joint.confidence
+                confidence: joint.confidence,
+                z: joint.z.map { ($0 - centerZ) / scale }
             )
         }
 
@@ -134,7 +141,14 @@ nonisolated enum PoseFrameFactory {
 
     private static func distance(_ first: PoseJoint?, _ second: PoseJoint?) -> Double {
         guard let first, let second else { return 0 }
-        return hypot(first.x - second.x, first.y - second.y)
+        let depthDelta = first.z.flatMap { firstZ in
+            second.z.map { firstZ - $0 }
+        } ?? 0
+        return sqrt(
+            pow(first.x - second.x, 2) +
+                pow(first.y - second.y, 2) +
+                pow(depthDelta, 2)
+        )
     }
 
     private static func average(_ first: PoseJoint?, _ second: PoseJoint?) -> PoseJoint? {
@@ -142,8 +156,22 @@ nonisolated enum PoseFrameFactory {
         return PoseJoint(
             x: (first.x + second.x) / 2,
             y: (first.y + second.y) / 2,
-            confidence: min(first.confidence, second.confidence)
+            confidence: min(first.confidence, second.confidence),
+            z: averageDepth(first.z, second.z)
         )
+    }
+
+    private static func averageDepth(_ first: Double?, _ second: Double?) -> Double? {
+        switch (first, second) {
+        case let (first?, second?):
+            (first + second) / 2
+        case let (first?, nil):
+            first
+        case let (nil, second?):
+            second
+        case (nil, nil):
+            nil
+        }
     }
 }
 
