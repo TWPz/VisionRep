@@ -17,8 +17,10 @@ struct WorkoutDashboardView: View {
 
                 Spacer(minLength: 20)
 
-                centerContent
-                    .padding(.horizontal, 20)
+                if shouldShowCenterReadout {
+                    centerReadout
+                        .padding(.horizontal, 20)
+                }
 
                 Spacer(minLength: 18)
 
@@ -26,6 +28,8 @@ struct WorkoutDashboardView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 14)
             }
+
+            countdownOverlay
         }
         .background(Color.black)
         .preferredColorScheme(.dark)
@@ -63,82 +67,88 @@ struct WorkoutDashboardView: View {
     }
 
     private var topBarContent: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("VisionRep")
-                    .font(.title3.weight(.semibold))
-                Text(model.statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.82)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("VisionRep")
+                        .font(.title3.weight(.semibold))
+                    Text(model.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
+
+                Spacer(minLength: 12)
+
+                QualityBadge(quality: model.poseQuality)
             }
 
-            Spacer(minLength: 12)
-
-            QualityBadge(quality: model.poseQuality)
+            if shouldShowTrainingStatus {
+                SlimTrainingStatus(
+                    completedCount: model.templates.count,
+                    activeFrameCount: model.activeCaptureFrameCount,
+                    isRecording: isRecordingTemplate,
+                    voiceCommandStatus: model.voiceCommandStatus
+                )
+            }
         }
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .visionGlassPanel(cornerRadius: 24, tint: .white.opacity(0.08))
     }
 
     private var centerReadout: some View {
-        VStack(spacing: 14) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(model.repetitionCount)")
-                    .font(.system(size: 88, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                Text("reps")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 10) {
-                MetricChip(title: "Templates", value: "\(model.templates.count)/5", systemImage: "figure.run")
-                MetricChip(title: "Match", value: model.matchConfidence.formatted(.percent.precision(.fractionLength(0))), systemImage: "waveform.path.ecg")
-                MetricChip(title: "Frames", value: "\(model.activeCaptureFrameCount)", systemImage: "timer")
-            }
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("\(model.repetitionCount)")
+                .font(.system(size: 112, weight: .bold, design: .rounded))
+                .monospacedDigit()
+            Text("reps")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 18)
-        .padding(.horizontal, 16)
+        .padding(.vertical, 22)
+        .padding(.horizontal, 24)
         .visionGlassPanel(cornerRadius: 28, tint: .black.opacity(0.08))
-    }
-
-    @ViewBuilder
-    private var centerContent: some View {
-        if shouldShowCenterReadout {
-            centerReadout
-        } else {
-            trainingReadout
-        }
     }
 
     private var shouldShowCenterReadout: Bool {
-        model.mode == .counting && model.templates.count >= 3
+        model.mode == .counting && model.templates.count >= 3 && model.countingCountdownRemaining == nil
     }
 
-    private var trainingReadout: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "figure.mixed.cardio")
-                .font(.system(size: 46, weight: .semibold))
-                .foregroundStyle(.mint)
-
-            Text("Train Movement")
-                .font(.title2.weight(.semibold))
-
-            Text("\(min(model.templates.count, 3)) of 3 successful reps")
-                .font(.headline.monospacedDigit())
-                .foregroundStyle(.secondary)
-
-            ProgressView(value: Double(min(model.templates.count, 3)), total: 3)
-                .tint(.mint)
+    private var shouldShowTrainingStatus: Bool {
+        switch model.mode {
+        case .recordingTemplate:
+            model.trainingCountdownRemaining == nil
+        case .cameraReady:
+            model.templates.count < 5
+        case .templatesReady:
+            model.templates.count < 5
+        case .setup, .counting:
+            false
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .padding(.horizontal, 16)
-        .visionGlassPanel(cornerRadius: 28, tint: .black.opacity(0.08))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Train movement, \(min(model.templates.count, 3)) of 3 successful reps")
+    }
+
+    @ViewBuilder
+    private var countdownOverlay: some View {
+        if let countdownRemaining {
+            CenterTrainingCountdownView(remaining: countdownRemaining)
+                .padding(.horizontal, 32)
+                .transition(.scale(scale: 0.92).combined(with: .opacity))
+                .animation(.snappy(duration: 0.22), value: countdownRemaining)
+                .accessibilitySortPriority(10)
+        }
+    }
+
+    private var countdownRemaining: Int? {
+        model.countingCountdownRemaining ?? model.trainingCountdownRemaining
+    }
+
+    private var isRecordingTemplate: Bool {
+        if case .recordingTemplate = model.mode {
+            return true
+        }
+        return false
     }
 
     private var controlDock: some View {
@@ -164,9 +174,9 @@ struct WorkoutDashboardView: View {
                 .accessibilityLabel("Reset calibration")
             }
 
-            if model.mode == .templatesReady, model.templates.count < 5 {
-                GlassActionButton(title: "Record Another Template", systemImage: "plus.circle") {
-                    model.recordAdditionalTemplate()
+            if model.templates.count >= 3 && model.templates.count < 5 && model.mode == .templatesReady {
+                LiveCountButton {
+                    model.startCountingFromTemplates()
                 }
             }
 
@@ -185,19 +195,109 @@ struct WorkoutDashboardView: View {
         case .counting:
             "pause.fill"
         case .cameraReady, .templatesReady:
-            model.templates.count >= 3 ? "play.fill" : "record.circle"
+            model.templates.count >= 5 ? "play.fill" : "record.circle"
         }
     }
 
     private var primaryActionEnabled: Bool {
         switch model.mode {
-        case .setup, .recordingTemplate, .counting:
+        case .setup, .counting:
+            model.countingCountdownRemaining == nil
+        case .recordingTemplate:
+            model.trainingCountdownRemaining == nil
+        case .cameraReady, .templatesReady:
             true
-        case .cameraReady:
-            model.canRecordTemplate
-        case .templatesReady:
-            model.templates.count >= 3 || model.canRecordTemplate
         }
+    }
+}
+
+private struct SlimTrainingStatus: View {
+    var completedCount: Int
+    var activeFrameCount: Int
+    var isRecording: Bool
+    var voiceCommandStatus: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: iconName)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+
+            ProgressView(value: Double(completedCount), total: 5)
+                .tint(.mint)
+                .frame(maxWidth: 96)
+
+            Text(statusText)
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Train movement, \(completedCount) of 5 successful reps")
+    }
+
+    private var iconName: String {
+        if isRecording {
+            "record.circle.fill"
+        } else {
+            "figure.mixed.cardio"
+        }
+    }
+
+    private var iconColor: Color {
+        if isRecording {
+            .red
+        } else {
+            .mint
+        }
+    }
+
+    private var title: String {
+        "Train Movement"
+    }
+
+    private var statusText: String {
+        if isRecording {
+            let voiceText = voiceCommandStatus.isEmpty ? "say stop" : voiceCommandStatus.lowercased()
+            return "\(activeFrameCount) frames - \(voiceText)"
+        } else {
+            return "\(completedCount)/5 reps"
+        }
+    }
+}
+
+private struct LiveCountButton: View {
+    var action: () -> Void
+
+    var body: some View {
+        GlassActionButton(title: "Count Live", systemImage: "play.fill", action: action)
+    }
+}
+
+private struct CenterTrainingCountdownView: View {
+    var remaining: Int
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("\(remaining)")
+                .font(.system(size: 96, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .contentTransition(.numericText())
+
+            Text("Get ready")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 190, height: 190)
+        .visionGlassPanel(cornerRadius: 32, tint: .black.opacity(0.16))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Recording starts in \(remaining)")
     }
 }
 

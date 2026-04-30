@@ -15,20 +15,61 @@ nonisolated struct CountUpdate: Equatable, Sendable {
     var confidence: Double
     var bestScore: Double
     var matchedTemplateIndex: Int?
+    var matchedTemplateSource: TemplateMatchSource?
+    var onlineTemplateCount = 0
+}
+
+nonisolated enum TemplateMatchSource: String, Equatable, Sendable {
+    case anchor
+    case online
 }
 
 nonisolated final class FewShotRepetitionCounter {
     private let sampleCount = 48
+    private let maxOnlineTemplateCount = 4
+    private let onlinePromotionConfidenceThreshold = 0.85
     private var templates: [MovementTemplate] = []
-    private var threshold: Double = 0.22
+    private var onlineTemplates: [OnlineTemplateRecord] = []
+    private var anchorThreshold: Double = 0.22
     private var buffer: [PoseFrame] = []
     private var lastCountTimestamp: TimeInterval = -.infinity
     private(set) var repetitions = 0
     private(set) var confidence = 0.0
     private(set) var bestScore = Double.infinity
 
+    private struct OnlineTemplateRecord {
+        var template: MovementTemplate
+        var promotionConfidence: Double
+        var anchorScore: Double
+
+        func trustScore(anchorThreshold: Double) -> Double {
+            let closeness = max(0, min(1, 1 - (anchorScore / max(anchorThreshold, 0.001))))
+            return (promotionConfidence * 0.45) + (template.qualityScore * 0.35) + (closeness * 0.2)
+        }
+    }
+
+    private struct TemplateRecord {
+        var template: MovementTemplate
+        var source: TemplateMatchSource
+    }
+
+    private struct Candidate {
+        var score: Double
+        var templateIndex: Int
+        var source: TemplateMatchSource
+        var acceptanceThreshold: Double
+        var segment: [PoseFrame]
+        var vectors: [PoseFeatureVector]
+        var anchorScore: Double
+        var averageQuality: Double
+    }
+
     var hasTemplates: Bool {
         !templates.isEmpty
+    }
+
+    var onlineTemplateCount: Int {
+        onlineTemplates.count
     }
 
     func resetCount() {
@@ -41,8 +82,13 @@ nonisolated final class FewShotRepetitionCounter {
 
     func load(templates: [MovementTemplate]) {
         self.templates = templates
-        threshold = Self.learnThreshold(from: templates)
+        onlineTemplates.removeAll(keepingCapacity: true)
+        anchorThreshold = Self.learnThreshold(from: templates)
         resetCount()
+    }
+
+    func clearOnlineTemplates() {
+        onlineTemplates.removeAll(keepingCapacity: true)
     }
 
     func makeTemplate(index: Int, frames: [PoseFrame], averageQuality: Double) -> MovementTemplate? {
@@ -63,63 +109,245 @@ nonisolated final class FewShotRepetitionCounter {
 
     func update(with frame: PoseFrame) -> CountUpdate {
         guard !templates.isEmpty else {
-            return CountUpdate(repetitions: repetitions, confidence: 0, bestScore: .infinity, matchedTemplateIndex: nil)
+            return CountUpdate(
+                repetitions: repetitions,
+                confidence: 0,
+                bestScore: .infinity,
+                matchedTemplateIndex: nil,
+                matchedTemplateSource: nil,
+                onlineTemplateCount: onlineTemplateCount
+            )
         }
 
         buffer.append(frame)
         trimBuffer(now: frame.timestamp)
 
         let candidate = bestCandidate()
-        bestScore = candidate.score
-        confidence = max(0, min(1, 1 - (candidate.score / threshold)))
+        bestScore = candidate?.score ?? .infinity
+        confidence = confidence(for: candidate)
 
-        let cooldownElapsed = frame.timestamp - lastCountTimestamp > 1.1
-        if candidate.score <= threshold, cooldownElapsed {
+        let cooldownElapsed = frame.timestamp - lastCountTimestamp > completionCooldown
+        if let candidate, candidate.score <= candidate.acceptanceThreshold, cooldownElapsed {
             repetitions += 1
             lastCountTimestamp = frame.timestamp
+            promoteOnlineTemplate(from: candidate)
             buffer.removeAll(keepingCapacity: true)
         }
 
         return CountUpdate(
             repetitions: repetitions,
             confidence: confidence,
-            bestScore: candidate.score,
-            matchedTemplateIndex: candidate.templateIndex
+            bestScore: bestScore,
+            matchedTemplateIndex: candidate?.templateIndex,
+            matchedTemplateSource: candidate?.source,
+            onlineTemplateCount: onlineTemplateCount
         )
     }
 
     private func trimBuffer(now: TimeInterval) {
-        let longestTemplate = templates.map(\.duration).max() ?? 4
+        let longestTemplate = matchingTemplates.map(\.template.duration).max() ?? 4
         let window = max(8, longestTemplate * 1.7)
         buffer.removeAll { now - $0.timestamp > window }
     }
 
-    private func bestCandidate() -> (score: Double, templateIndex: Int?) {
+    private func bestCandidate() -> Candidate? {
         guard buffer.count >= 18 else {
-            return (.infinity, nil)
+            return nil
         }
 
-        var best = (score: Double.infinity, templateIndex: Optional<Int>.none)
+        var best: Candidate?
 
-        for template in templates {
-            let expectedFrames = max(template.sourceFrameCount, 20)
-            let possibleLengths = stride(
-                from: max(Int(Double(expectedFrames) * 0.72), 18),
-                through: min(Int(Double(expectedFrames) * 1.45), buffer.count),
-                by: 4
-            )
+        for record in matchingTemplates {
+            let template = record.template
+            guard let strictLengthRange = strictLengthRange(for: template, availableCount: buffer.count) else {
+                continue
+            }
 
-            for length in possibleLengths {
+            for length in stride(from: strictLengthRange.lowerBound, through: strictLengthRange.upperBound, by: 4) {
                 let segment = Array(buffer.suffix(length))
+                guard segmentDuration(segment) >= minimumCandidateDuration(for: template) else {
+                    continue
+                }
                 let vectors = resample(segment.map(Self.vector), targetCount: sampleCount)
+                let candidateMovement = Self.movementMagnitude(vectors)
+                guard candidateMovement >= minimumCandidateMovement(for: template) else {
+                    continue
+                }
+
+                let anchorScore = closestAnchorScore(
+                    to: vectors,
+                    duration: segmentDuration(segment),
+                    movement: candidateMovement
+                )
+
+                guard record.source == .anchor || anchorCorroborates(anchorScore) else {
+                    continue
+                }
+
                 let score = Self.distance(vectors, template.vectors)
-                if score < best.score {
-                    best = (score, template.index)
+                let candidateThreshold = acceptanceThreshold(for: record.source)
+                let candidateRank = score / max(candidateThreshold, 0.001)
+                let bestRank = best.map { $0.score / max($0.acceptanceThreshold, 0.001) } ?? .infinity
+
+                if candidateRank < bestRank {
+                    best = Candidate(
+                        score: score,
+                        templateIndex: template.index,
+                        source: record.source,
+                        acceptanceThreshold: candidateThreshold,
+                        segment: segment,
+                        vectors: vectors,
+                        anchorScore: anchorScore,
+                        averageQuality: Self.averageJointConfidence(in: segment)
+                    )
                 }
             }
         }
 
         return best
+    }
+
+    private var matchingTemplates: [TemplateRecord] {
+        templates.map { TemplateRecord(template: $0, source: .anchor) }
+            + onlineTemplates.map { TemplateRecord(template: $0.template, source: .online) }
+    }
+
+    private var completionCooldown: TimeInterval {
+        let shortestTemplate = templates.map(\.duration).min() ?? 1.6
+        return max(1.1, shortestTemplate * 0.72)
+    }
+
+    private func acceptanceThreshold(for source: TemplateMatchSource) -> Double {
+        switch source {
+        case .anchor:
+            anchorThreshold
+        case .online:
+            onlineAcceptanceThreshold
+        }
+    }
+
+    private var onlineAcceptanceThreshold: Double {
+        max(0.12, anchorThreshold * 0.88)
+    }
+
+    private func confidence(for candidate: Candidate?) -> Double {
+        guard let candidate else { return 0 }
+        return max(0, min(1, 1 - (candidate.score / max(candidate.acceptanceThreshold, 0.001))))
+    }
+
+    private func strictLengthRange(for template: MovementTemplate, availableCount: Int) -> ClosedRange<Int>? {
+        let expectedFrames = max(template.sourceFrameCount, 20)
+        let lowerBound = max(Int((Double(expectedFrames) * 0.92).rounded(.down)), 20)
+        let upperBound = min(Int((Double(expectedFrames) * 1.28).rounded(.up)), availableCount)
+
+        guard lowerBound <= upperBound else {
+            return nil
+        }
+        return lowerBound...upperBound
+    }
+
+    private func minimumCandidateDuration(for template: MovementTemplate) -> TimeInterval {
+        max(template.duration * 0.82, 0.8)
+    }
+
+    private func segmentDuration(_ segment: [PoseFrame]) -> TimeInterval {
+        guard let first = segment.first, let last = segment.last else {
+            return 0
+        }
+        return max(last.timestamp - first.timestamp, 0)
+    }
+
+    private func minimumCandidateMovement(for template: MovementTemplate) -> Double {
+        max(Self.movementMagnitude(template.vectors) * 0.45, 0.025)
+    }
+
+    private func anchorCorroborates(_ anchorScore: Double) -> Bool {
+        anchorScore <= min(max(anchorThreshold * 1.35, anchorThreshold + 0.04), 0.42)
+    }
+
+    private func closestAnchorScore(
+        to vectors: [PoseFeatureVector],
+        duration: TimeInterval,
+        movement: Double
+    ) -> Double {
+        var closest = Double.infinity
+
+        for template in templates {
+            let durationRatio = duration / max(template.duration, 0.1)
+            guard (0.72...1.42).contains(durationRatio) else {
+                continue
+            }
+
+            let templateMovement = Self.movementMagnitude(template.vectors)
+            guard movement >= max(templateMovement * 0.42, 0.02) else {
+                continue
+            }
+
+            closest = min(closest, Self.distance(vectors, template.vectors))
+        }
+
+        return closest
+    }
+
+    private func promoteOnlineTemplate(from candidate: Candidate) {
+        let promotionConfidence = confidence(for: candidate)
+        guard promotionConfidence >= onlinePromotionConfidenceThreshold else {
+            return
+        }
+        guard anchorCorroborates(candidate.anchorScore) else {
+            return
+        }
+        guard !isDuplicateOnlineTemplate(candidate.vectors) else {
+            return
+        }
+        guard let template = makeTemplate(
+            index: nextOnlineTemplateIndex,
+            frames: candidate.segment,
+            averageQuality: candidate.averageQuality
+        ) else {
+            return
+        }
+
+        onlineTemplates.append(
+            OnlineTemplateRecord(
+                template: template,
+                promotionConfidence: promotionConfidence,
+                anchorScore: candidate.anchorScore
+            )
+        )
+        evictWeakOnlineTemplatesIfNeeded()
+    }
+
+    private var nextOnlineTemplateIndex: Int {
+        let highestAnchorIndex = templates.map(\.index).max() ?? 0
+        let highestOnlineIndex = onlineTemplates.map(\.template.index).max() ?? highestAnchorIndex
+        return max(highestAnchorIndex, highestOnlineIndex) + 1
+    }
+
+    private func isDuplicateOnlineTemplate(_ vectors: [PoseFeatureVector]) -> Bool {
+        let duplicateDistance = max(anchorThreshold * 0.12, 0.018)
+        return onlineTemplates.contains { record in
+            Self.distance(vectors, record.template.vectors) <= duplicateDistance
+        }
+    }
+
+    private func evictWeakOnlineTemplatesIfNeeded() {
+        while onlineTemplates.count > maxOnlineTemplateCount {
+            guard let weakestIndex = onlineTemplates.indices.min(by: { left, right in
+                let leftRecord = onlineTemplates[left]
+                let rightRecord = onlineTemplates[right]
+                let leftTrust = leftRecord.trustScore(anchorThreshold: anchorThreshold)
+                let rightTrust = rightRecord.trustScore(anchorThreshold: anchorThreshold)
+
+                if leftTrust == rightTrust {
+                    return leftRecord.template.capturedAt < rightRecord.template.capturedAt
+                }
+                return leftTrust < rightTrust
+            }) else {
+                return
+            }
+            onlineTemplates.remove(at: weakestIndex)
+        }
     }
 
     private static func learnThreshold(from templates: [MovementTemplate]) -> Double {
@@ -197,6 +425,22 @@ nonisolated final class FewShotRepetitionCounter {
             partial + pair.0.distance(to: pair.1)
         }
         return total / Double(left.count)
+    }
+
+    private static func movementMagnitude(_ vectors: [PoseFeatureVector]) -> Double {
+        guard vectors.count > 1 else { return 0 }
+        let total = zip(vectors, vectors.dropFirst()).reduce(0) { partial, pair in
+            partial + pair.0.distance(to: pair.1)
+        }
+        return total / Double(vectors.count - 1)
+    }
+
+    private static func averageJointConfidence(in segment: [PoseFrame]) -> Double {
+        let confidences = segment.flatMap { frame in
+            frame.joints.values.map(\.confidence)
+        }
+        guard !confidences.isEmpty else { return 0 }
+        return confidences.reduce(0, +) / Double(confidences.count)
     }
 }
 

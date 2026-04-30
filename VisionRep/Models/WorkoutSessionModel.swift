@@ -24,13 +24,21 @@ final class WorkoutSessionModel {
     var repetitionCount = 0
     var matchConfidence = 0.0
     var latestMatcherScore = Double.infinity
+    var trainingCountdownRemaining: Int?
+    var countingCountdownRemaining: Int?
+    var voiceCommandStatus = ""
     var statusMessage = "Start the camera and keep your full body in frame."
 
     @ObservationIgnored private let frameBridge = PoseProcessingBridge()
     @ObservationIgnored private let repetitionCounter = FewShotRepetitionCounter()
     @ObservationIgnored private let profileStore = ExerciseProfileStore()
+    @ObservationIgnored private let voiceCommandListener = VoiceCommandListener()
     @ObservationIgnored private var activeCaptureFrames: [PoseFrame] = []
     @ObservationIgnored private var activeCaptureQualityScores: [Double] = []
+    @ObservationIgnored private var trainingCountdownTask: Task<Void, Never>?
+    @ObservationIgnored private var countingCountdownTask: Task<Void, Never>?
+    @ObservationIgnored private var isTemplateCaptureActive = false
+    @ObservationIgnored private var isLiveCountingActive = false
 
     init() {
         templates = profileStore.loadTemplates()
@@ -70,11 +78,19 @@ final class WorkoutSessionModel {
         case .setup:
             "Start Camera"
         case .cameraReady, .templatesReady:
-            templates.count >= 3 ? "Count Live" : "Record Rep"
+            templates.count >= 5 ? "Count Live" : "Record Rep"
         case .recordingTemplate:
-            "Finish Rep"
+            if let trainingCountdownRemaining {
+                "Starting in \(trainingCountdownRemaining)"
+            } else {
+                "Finish Rep"
+            }
         case .counting:
-            "Pause"
+            if let countingCountdownRemaining {
+                "Starting in \(countingCountdownRemaining)"
+            } else {
+                "Pause"
+            }
         }
     }
 
@@ -83,7 +99,7 @@ final class WorkoutSessionModel {
         case .setup:
             startCamera()
         case .cameraReady, .templatesReady:
-            if templates.count >= 3 {
+            if templates.count >= 5 {
                 startCounting()
             } else {
                 beginTemplateRecording()
@@ -104,20 +120,27 @@ final class WorkoutSessionModel {
     }
 
     func beginTemplateRecording() {
-        guard canRecordTemplate else {
-            statusMessage = poseQuality.guidance
+        guard cameraState == .running else {
+            statusMessage = "Start the camera before recording a training rep."
             return
         }
 
         activeCaptureFrames.removeAll(keepingCapacity: true)
         activeCaptureQualityScores.removeAll(keepingCapacity: true)
         activeCaptureFrameCount = 0
+        isTemplateCaptureActive = false
+        stopCountingCountdown()
+        isLiveCountingActive = false
         mode = .recordingTemplate(templates.count + 1)
-        statusMessage = "Perform one complete repetition, then tap Finish Rep."
+        startVoiceCommands()
+        startTrainingCountdown()
     }
 
     func finishTemplateRecording() {
         guard case .recordingTemplate(let index) = mode else { return }
+        stopTrainingCountdown()
+        stopVoiceCommands()
+        isTemplateCaptureActive = false
 
         let averageQuality = activeCaptureQualityScores.average
         guard let template = repetitionCounter.makeTemplate(
@@ -139,16 +162,19 @@ final class WorkoutSessionModel {
         activeCaptureQualityScores.removeAll(keepingCapacity: true)
         activeCaptureFrameCount = 0
         repetitionCounter.load(templates: templates)
+        trainingCountdownRemaining = nil
 
         mode = templates.count >= 3 ? .templatesReady : .cameraReady
-        statusMessage = templates.count >= 3
-            ? "Templates are calibrated. You can record up to 5 or start counting."
-            : "Template saved. Record \(3 - templates.count) more."
+        statusMessage = trainingProgressMessage
     }
 
     func recordAdditionalTemplate() {
         guard templates.count < 5, mode == .templatesReady else { return }
         beginTemplateRecording()
+    }
+
+    func startCountingFromTemplates() {
+        startCounting()
     }
 
     func startCounting() {
@@ -161,11 +187,17 @@ final class WorkoutSessionModel {
         repetitionCount = 0
         matchConfidence = 0
         latestMatcherScore = .infinity
+        stopTrainingCountdown()
+        stopVoiceCommands()
+        isLiveCountingActive = false
         mode = .counting
-        statusMessage = "Counting live. Complete the same movement path you recorded."
+        startCountingCountdown()
     }
 
     func pauseCounting() {
+        stopCountingCountdown()
+        isLiveCountingActive = false
+        repetitionCounter.clearOnlineTemplates()
         mode = .templatesReady
         statusMessage = "Counting paused. Templates remain on this device."
     }
@@ -173,13 +205,21 @@ final class WorkoutSessionModel {
     func resetCalibration() {
         templates.removeAll()
         profileStore.deleteTemplates()
+        stopTrainingCountdown()
+        stopCountingCountdown()
+        stopVoiceCommands()
+        isTemplateCaptureActive = false
+        isLiveCountingActive = false
         activeCaptureFrames.removeAll()
         activeCaptureQualityScores.removeAll()
         activeCaptureFrameCount = 0
+        repetitionCounter.clearOnlineTemplates()
         repetitionCounter.load(templates: [])
         repetitionCount = 0
         matchConfidence = 0
         latestMatcherScore = .infinity
+        trainingCountdownRemaining = nil
+        countingCountdownRemaining = nil
         mode = cameraState == .running ? .cameraReady : .setup
         statusMessage = "Calibration reset. Record 3 to 5 clean reps."
     }
@@ -193,7 +233,9 @@ final class WorkoutSessionModel {
         case .noPose:
             latestPose = nil
             poseQuality = PoseQuality(trackedJointRatio: 0, requiredJointRatio: 0, averageConfidence: 0)
-            statusMessage = "No body detected. Step into frame."
+            if trainingCountdownRemaining == nil, countingCountdownRemaining == nil {
+                statusMessage = "No body detected. Step into frame."
+            }
         case .skipped:
             break
         case .failed(let message):
@@ -224,6 +266,9 @@ final class WorkoutSessionModel {
     private func ingest(_ frame: PoseFrame, quality: PoseQuality) {
         switch mode {
         case .recordingTemplate:
+            guard isTemplateCaptureActive else {
+                return
+            }
             guard quality.score >= 0.48 else {
                 statusMessage = quality.guidance
                 return
@@ -232,6 +277,9 @@ final class WorkoutSessionModel {
             activeCaptureQualityScores.append(quality.score)
             activeCaptureFrameCount = activeCaptureFrames.count
         case .counting:
+            guard isLiveCountingActive else {
+                return
+            }
             let update = repetitionCounter.update(with: frame)
             repetitionCount = update.repetitions
             matchConfidence = update.confidence
@@ -247,6 +295,97 @@ final class WorkoutSessionModel {
             if quality.score < 0.58 {
                 statusMessage = quality.guidance
             }
+        }
+    }
+
+    private func startTrainingCountdown() {
+        stopTrainingCountdown()
+        trainingCountdownTask = Task { @MainActor [weak self] in
+            for remaining in stride(from: 3, through: 1, by: -1) {
+                guard let self, !Task.isCancelled else { return }
+                self.trainingCountdownRemaining = remaining
+                self.statusMessage = "Get ready. Recording starts in \(remaining)."
+                try? await Task.sleep(for: .seconds(1))
+            }
+
+            guard let self, !Task.isCancelled else { return }
+            self.trainingCountdownRemaining = nil
+            self.isTemplateCaptureActive = true
+            self.activeCaptureFrameCount = 0
+            self.statusMessage = "Recording now. Say stop or tap Finish Rep."
+        }
+    }
+
+    private func stopTrainingCountdown() {
+        trainingCountdownTask?.cancel()
+        trainingCountdownTask = nil
+        trainingCountdownRemaining = nil
+    }
+
+    private func startCountingCountdown() {
+        stopCountingCountdown()
+        countingCountdownTask = Task { @MainActor [weak self] in
+            for remaining in stride(from: 5, through: 1, by: -1) {
+                guard let self, !Task.isCancelled else { return }
+                self.countingCountdownRemaining = remaining
+                self.statusMessage = "Get ready. Counting starts in \(remaining)."
+                try? await Task.sleep(for: .seconds(1))
+            }
+
+            guard let self, !Task.isCancelled else { return }
+            self.countingCountdownRemaining = nil
+            self.isLiveCountingActive = true
+            self.repetitionCounter.resetCount()
+            self.repetitionCount = 0
+            self.matchConfidence = 0
+            self.latestMatcherScore = .infinity
+            self.statusMessage = "Counting live. Complete the same movement path you recorded."
+        }
+    }
+
+    private func stopCountingCountdown() {
+        countingCountdownTask?.cancel()
+        countingCountdownTask = nil
+        countingCountdownRemaining = nil
+    }
+
+    private func startVoiceCommands() {
+        voiceCommandStatus = "Voice preparing"
+        voiceCommandListener.start { [weak self] command in
+            self?.handleVoiceCommand(command)
+        } onStatus: { [weak self] status in
+            self?.voiceCommandStatus = status
+        }
+    }
+
+    private func stopVoiceCommands() {
+        voiceCommandListener.stop()
+        voiceCommandStatus = ""
+    }
+
+    private func handleVoiceCommand(_ command: VoiceCommandListener.Command) {
+        guard case .recordingTemplate = mode else {
+            return
+        }
+
+        switch command {
+        case .stop:
+            guard isTemplateCaptureActive else {
+                voiceCommandStatus = "Stop ignored until recording"
+                return
+            }
+            finishTemplateRecording()
+        }
+    }
+
+    private var trainingProgressMessage: String {
+        switch templates.count {
+        case 0..<3:
+            "Template saved. Record \(3 - templates.count) more."
+        case 3..<5:
+            "Template saved. Continue to 5 reps or start counting live."
+        default:
+            "All 5 templates captured. Start counting live."
         }
     }
 }
