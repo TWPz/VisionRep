@@ -12,7 +12,7 @@ rg -q 'anchorCorroborates' "$counter_file"
 rg -q 'promoteOnlineTemplate' "$counter_file"
 rg -q 'onlineAcceptanceThreshold' "$counter_file"
 rg -q 'anchorThreshold' "$counter_file"
-rg -q 'repetitionCounter.clearOnlineTemplates\(\)' "$session_file"
+rg -q 'liveRepetitionCounter.clearOnlineTemplates\(\)' "$session_file"
 
 tmp_file="$(mktemp /tmp/visionrep-online-template-adaptation-XXXXXX.swift)"
 trap 'rm -f "$tmp_file"' EXIT

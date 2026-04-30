@@ -9,6 +9,11 @@ nonisolated enum CameraState: Equatable, Sendable {
     case failed(String)
 }
 
+nonisolated enum CameraFramingMode: Equatable, Sendable {
+    case centerStageTracking
+    case widestView
+}
+
 nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
 
@@ -18,6 +23,7 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
     private let videoQueue = DispatchQueue(label: "com.visionrep.camera.frames", qos: .userInitiated)
     private let output = AVCaptureVideoDataOutput()
     private let targetCameraFramesPerSecond: Double = 30
+    private var framingMode: CameraFramingMode = .centerStageTracking
     private var isConfigured = false
 
     func requestAccessAndConfigure(completion: @escaping (CameraState) -> Void) {
@@ -61,6 +67,43 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         }
     }
 
+    func setFramingMode(_ mode: CameraFramingMode, completion: @escaping (CameraState) -> Void) {
+        DispatchQueue.main.async {
+            completion(.configuring)
+        }
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            self.framingMode = mode
+            guard self.isConfigured else {
+                DispatchQueue.main.async {
+                    completion(.idle)
+                }
+                return
+            }
+
+            let wasRunning = self.session.isRunning
+            if wasRunning {
+                self.session.stopRunning()
+            }
+
+            do {
+                try self.configureSession()
+                if wasRunning {
+                    self.session.startRunning()
+                }
+                DispatchQueue.main.async {
+                    completion(wasRunning ? .running : .idle)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failed(error.localizedDescription))
+                }
+            }
+        }
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         frameHandler?(sampleBuffer)
     }
@@ -98,11 +141,11 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
             session.sessionPreset = .hd1280x720
         }
 
-        guard let device = preferredFrontCamera() else {
+        guard let device = preferredFrontCamera(for: framingMode) else {
             throw CameraConfigurationError.noCamera
         }
 
-        try configureDevice(device)
+        try configureDevice(device, for: framingMode)
 
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else {
@@ -131,30 +174,37 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         }
     }
 
-    private func preferredFrontCamera() -> AVCaptureDevice? {
+    private func preferredFrontCamera(for mode: CameraFramingMode) -> AVCaptureDevice? {
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInUltraWideCamera, .builtInTrueDepthCamera, .builtInWideAngleCamera],
             mediaType: .video,
             position: .front
         )
 
-        let centerStageDevices = discovery.devices.filter { device in
-            device.formats.contains(where: \.isCenterStageSupported)
+        let candidates: [AVCaptureDevice]
+        switch mode {
+        case .widestView:
+            let ultraWideDevices = discovery.devices.filter { $0.deviceType == .builtInUltraWideCamera }
+            candidates = ultraWideDevices.isEmpty ? discovery.devices : ultraWideDevices
+        case .centerStageTracking:
+            let centerStageDevices = discovery.devices.filter { device in
+                device.formats.contains(where: \.isCenterStageSupported)
+            }
+            candidates = centerStageDevices.isEmpty ? discovery.devices : centerStageDevices
         }
-        let candidates = centerStageDevices.isEmpty ? discovery.devices : centerStageDevices
 
         return candidates.max { lhs, rhs in
-            widestSupportedFieldOfView(for: lhs) < widestSupportedFieldOfView(for: rhs)
+            widestSupportedFieldOfView(for: lhs, mode: mode) < widestSupportedFieldOfView(for: rhs, mode: mode)
         }
     }
 
-    private func configureDevice(_ device: AVCaptureDevice) throws {
-        configureCenterStageIfSupported(by: device)
+    private func configureDevice(_ device: AVCaptureDevice, for mode: CameraFramingMode) throws {
+        configureCenterStage(for: mode, device: device)
 
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        if let wideFormat = preferredWideFieldOfViewFormat(for: device) {
+        if let wideFormat = preferredWideFieldOfViewFormat(for: device, mode: mode) {
             device.activeFormat = wideFormat
         }
 
@@ -165,19 +215,32 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         device.videoZoomFactor = device.minAvailableVideoZoomFactor
     }
 
-    private func configureCenterStageIfSupported(by device: AVCaptureDevice) {
-        guard device.formats.contains(where: \.isCenterStageSupported) else { return }
-
-        AVCaptureDevice.centerStageControlMode = .cooperative
-        AVCaptureDevice.isCenterStageEnabled = true
+    private func configureCenterStage(for mode: CameraFramingMode, device: AVCaptureDevice) {
+        switch mode {
+        case .widestView:
+            AVCaptureDevice.isCenterStageEnabled = false
+        case .centerStageTracking:
+            AVCaptureDevice.centerStageControlMode = .cooperative
+            guard device.formats.contains(where: \.isCenterStageSupported) else {
+                AVCaptureDevice.isCenterStageEnabled = false
+                return
+            }
+            AVCaptureDevice.isCenterStageEnabled = true
+        }
     }
 
-    private func preferredWideFieldOfViewFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+    private func preferredWideFieldOfViewFormat(for device: AVCaptureDevice, mode: CameraFramingMode) -> AVCaptureDevice.Format? {
         let frameRateFormats = device.formats.filter { format in
             format.supports(frameRate: targetCameraFramesPerSecond)
         }
-        let centerStageFormats = frameRateFormats.filter(\.isCenterStageSupported)
-        let candidates = centerStageFormats.isEmpty ? frameRateFormats : centerStageFormats
+        let candidates: [AVCaptureDevice.Format]
+        switch mode {
+        case .widestView:
+            candidates = frameRateFormats
+        case .centerStageTracking:
+            let centerStageFormats = frameRateFormats.filter(\.isCenterStageSupported)
+            candidates = centerStageFormats.isEmpty ? frameRateFormats : centerStageFormats
+        }
 
         return candidates.max { lhs, rhs in
             if lhs.videoFieldOfView == rhs.videoFieldOfView {
@@ -187,8 +250,8 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         }
     }
 
-    private func widestSupportedFieldOfView(for device: AVCaptureDevice) -> Float {
-        preferredWideFieldOfViewFormat(for: device)?.videoFieldOfView
+    private func widestSupportedFieldOfView(for device: AVCaptureDevice, mode: CameraFramingMode) -> Float {
+        preferredWideFieldOfViewFormat(for: device, mode: mode)?.videoFieldOfView
             ?? device.formats.map(\.videoFieldOfView).max()
             ?? 0
     }

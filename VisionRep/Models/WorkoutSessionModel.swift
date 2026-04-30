@@ -28,9 +28,11 @@ final class WorkoutSessionModel {
     var countingCountdownRemaining: Int?
     var voiceCommandStatus = ""
     var statusMessage = "Start the camera and keep your full body in frame."
+    var cameraFramingMode: CameraFramingMode = .centerStageTracking
 
     @ObservationIgnored private let frameBridge = PoseProcessingBridge()
-    @ObservationIgnored private let repetitionCounter = FewShotRepetitionCounter()
+    @ObservationIgnored private let templateBuilder = FewShotRepetitionCounter()
+    @ObservationIgnored private let liveRepetitionCounter = LiveRepetitionCounterBridge()
     @ObservationIgnored private let profileStore = ExerciseProfileStore()
     @ObservationIgnored private let voiceCommandListener = VoiceCommandListener()
     @ObservationIgnored private var activeCaptureFrames: [PoseFrame] = []
@@ -42,13 +44,17 @@ final class WorkoutSessionModel {
 
     init() {
         templates = profileStore.loadTemplates()
-        repetitionCounter.load(templates: templates)
+        templateBuilder.load(templates: templates)
+        liveRepetitionCounter.load(templates: templates)
         if !templates.isEmpty {
             statusMessage = "Loaded \(templates.count) local templates. Start the camera to count live."
         }
 
         frameBridge.onResult = { [weak self] result in
             self?.handle(result)
+        }
+        liveRepetitionCounter.onUpdate = { [weak self] update, quality in
+            self?.handleLiveCountUpdate(update, quality: quality)
         }
         camera.frameHandler = { [frameBridge] sampleBuffer in
             frameBridge.process(sampleBuffer)
@@ -119,6 +125,18 @@ final class WorkoutSessionModel {
         }
     }
 
+    func toggleCameraFramingMode() {
+        let nextMode: CameraFramingMode = cameraFramingMode == .centerStageTracking ? .widestView : .centerStageTracking
+        cameraFramingMode = nextMode
+        statusMessage = "Switching camera framing..."
+
+        camera.setFramingMode(nextMode) { [weak self] state in
+            Task { @MainActor in
+                self?.applyCameraFramingState(state, mode: nextMode)
+            }
+        }
+    }
+
     func beginTemplateRecording() {
         guard cameraState == .running else {
             statusMessage = "Start the camera before recording a training rep."
@@ -143,7 +161,7 @@ final class WorkoutSessionModel {
         isTemplateCaptureActive = false
 
         let averageQuality = activeCaptureQualityScores.average
-        guard let template = repetitionCounter.makeTemplate(
+        guard let template = templateBuilder.makeTemplate(
             index: index,
             frames: activeCaptureFrames,
             averageQuality: averageQuality
@@ -162,7 +180,8 @@ final class WorkoutSessionModel {
         activeCaptureFrames.removeAll(keepingCapacity: true)
         activeCaptureQualityScores.removeAll(keepingCapacity: true)
         activeCaptureFrameCount = 0
-        repetitionCounter.load(templates: templates)
+        templateBuilder.load(templates: templates)
+        liveRepetitionCounter.load(templates: templates)
         trainingCountdownRemaining = nil
 
         mode = templates.count >= 3 ? .templatesReady : .cameraReady
@@ -185,7 +204,7 @@ final class WorkoutSessionModel {
             return
         }
 
-        repetitionCounter.load(templates: templates)
+        liveRepetitionCounter.load(templates: templates)
         repetitionCount = 0
         matchConfidence = 0
         latestMatcherScore = .infinity
@@ -199,7 +218,7 @@ final class WorkoutSessionModel {
     func pauseCounting() {
         stopCountingCountdown()
         isLiveCountingActive = false
-        repetitionCounter.clearOnlineTemplates()
+        liveRepetitionCounter.clearOnlineTemplates()
         mode = .templatesReady
         statusMessage = "Counting paused. Templates remain on this device."
         refreshVoiceCommandsForCurrentMode()
@@ -216,8 +235,9 @@ final class WorkoutSessionModel {
         activeCaptureFrames.removeAll()
         activeCaptureQualityScores.removeAll()
         activeCaptureFrameCount = 0
-        repetitionCounter.clearOnlineTemplates()
-        repetitionCounter.load(templates: [])
+        liveRepetitionCounter.clearOnlineTemplates()
+        templateBuilder.load(templates: [])
+        liveRepetitionCounter.load(templates: [])
         repetitionCount = 0
         matchConfidence = 0
         latestMatcherScore = .infinity
@@ -269,6 +289,23 @@ final class WorkoutSessionModel {
         refreshVoiceCommandsForCurrentMode()
     }
 
+    private func applyCameraFramingState(_ state: CameraState, mode: CameraFramingMode) {
+        cameraState = state
+
+        switch state {
+        case .configuring:
+            statusMessage = "Switching camera framing..."
+        case .idle:
+            statusMessage = mode.readyMessage
+        case .running:
+            statusMessage = mode.readyMessage
+        case .needsPermission:
+            statusMessage = "Camera permission is required for on-device rep counting."
+        case .failed(let message):
+            statusMessage = message
+        }
+    }
+
     private func ingest(_ frame: PoseFrame, quality: PoseQuality) {
         switch mode {
         case .recordingTemplate:
@@ -286,21 +323,28 @@ final class WorkoutSessionModel {
             guard isLiveCountingActive else {
                 return
             }
-            let update = repetitionCounter.update(with: frame)
-            repetitionCount = update.repetitions
-            matchConfidence = update.confidence
-            latestMatcherScore = update.bestScore
-            if update.confidence > 0.72 {
-                statusMessage = "Movement matched template \(update.matchedTemplateIndex ?? 0)."
-            } else if quality.score < 0.58 {
-                statusMessage = quality.guidance
-            } else {
-                statusMessage = "Track the full recorded movement path."
-            }
+            liveRepetitionCounter.submit(frame, quality: quality)
         default:
             if quality.score < 0.58 {
                 statusMessage = quality.guidance
             }
+        }
+    }
+
+    private func handleLiveCountUpdate(_ update: CountUpdate, quality: PoseQuality) {
+        guard mode == .counting, isLiveCountingActive else {
+            return
+        }
+
+        repetitionCount = update.repetitions
+        matchConfidence = update.confidence
+        latestMatcherScore = update.bestScore
+        if update.confidence > 0.72 {
+            statusMessage = "Movement matched template \(update.matchedTemplateIndex ?? 0)."
+        } else if quality.score < 0.58 {
+            statusMessage = quality.guidance
+        } else {
+            statusMessage = "Track the full recorded movement path."
         }
     }
 
@@ -341,7 +385,7 @@ final class WorkoutSessionModel {
             guard let self, !Task.isCancelled else { return }
             self.countingCountdownRemaining = nil
             self.isLiveCountingActive = true
-            self.repetitionCounter.resetCount()
+            self.liveRepetitionCounter.resetCount()
             self.repetitionCount = 0
             self.matchConfidence = 0
             self.latestMatcherScore = .infinity
@@ -446,5 +490,16 @@ private extension Array where Element == Double {
     var average: Double {
         guard !isEmpty else { return 0 }
         return reduce(0, +) / Double(count)
+    }
+}
+
+private extension CameraFramingMode {
+    var readyMessage: String {
+        switch self {
+        case .centerStageTracking:
+            "Center Stage tracking is on. Use it when you want the camera to follow you."
+        case .widestView:
+            "Wide view is on. Use it when you need the maximum front camera field of view."
+        }
     }
 }

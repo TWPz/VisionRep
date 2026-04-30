@@ -81,7 +81,13 @@ struct WorkoutDashboardView: View {
 
                 Spacer(minLength: 12)
 
-                QualityBadge(quality: model.poseQuality)
+                HStack(spacing: 8) {
+                    QualityBadge(quality: model.poseQuality)
+
+                    CameraFramingToggleButton(mode: model.cameraFramingMode) {
+                        model.toggleCameraFramingMode()
+                    }
+                }
             }
 
             if shouldShowTrainingStatus {
@@ -302,6 +308,29 @@ private struct CenterTrainingCountdownView: View {
     }
 }
 
+private struct CameraFramingToggleButton: View {
+    var mode: CameraFramingMode
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: mode.systemImage)
+                    .font(.subheadline.weight(.bold))
+                Text(mode.shortTitle)
+                    .font(.caption2.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+            }
+            .frame(width: 54, height: 48)
+            .visionGlassPanel(cornerRadius: 16, tint: .white.opacity(0.1), interactive: true)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mode.accessibilityLabel)
+        .accessibilityHint("Switch camera framing")
+    }
+}
+
 private struct QualityBadge: View {
     var quality: PoseQuality
 
@@ -328,6 +357,35 @@ private struct QualityBadge: View {
             .yellow
         default:
             .red
+        }
+    }
+}
+
+private extension CameraFramingMode {
+    var shortTitle: String {
+        switch self {
+        case .centerStageTracking:
+            "Track"
+        case .widestView:
+            "Wide"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .centerStageTracking:
+            "dot.viewfinder"
+        case .widestView:
+            "arrow.up.left.and.arrow.down.right"
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .centerStageTracking:
+            "Center Stage tracking on"
+        case .widestView:
+            "Widest camera view on"
         }
     }
 }
