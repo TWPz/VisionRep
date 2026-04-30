@@ -28,7 +28,7 @@ final class WorkoutSessionModel {
     var countingCountdownRemaining: Int?
     var voiceCommandStatus = ""
     var statusMessage = "Start the camera and keep your full body in frame."
-    var cameraFramingMode: CameraFramingMode = .centerStageTracking
+    var cameraFramingMode: CameraFramingMode = .widestView
 
     @ObservationIgnored private let frameBridge = PoseProcessingBridge()
     @ObservationIgnored private let templateBuilder = FewShotRepetitionCounter()

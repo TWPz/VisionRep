@@ -23,7 +23,7 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
     private let videoQueue = DispatchQueue(label: "com.visionrep.camera.frames", qos: .userInitiated)
     private let output = AVCaptureVideoDataOutput()
     private let targetCameraFramesPerSecond: Double = 30
-    private var framingMode: CameraFramingMode = .centerStageTracking
+    private var framingMode: CameraFramingMode = .widestView
     private var isConfigured = false
 
     func requestAccessAndConfigure(completion: @escaping (CameraState) -> Void) {
