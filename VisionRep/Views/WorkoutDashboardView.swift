@@ -70,7 +70,7 @@ struct WorkoutDashboardView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("VisionRep")
+                    Text("VisionRep (Codex)")
                         .font(.title3.weight(.semibold))
                     Text(model.statusMessage)
                         .font(.caption)
