@@ -106,8 +106,11 @@ nonisolated final class FewShotRepetitionCounter {
 
     func makeTemplate(index: Int, frames: [PoseFrame], averageQuality: Double) -> MovementTemplate? {
         guard frames.count >= 20 else { return nil }
-        let normalized = resample(Self.featureVectors(from: frames), targetCount: sampleCount)
+        let rawVectors = Self.featureVectors(from: frames)
+        let normalized = resample(rawVectors, targetCount: sampleCount)
         guard normalized.count == sampleCount else { return nil }
+
+        let weighted = Self.applyFeatureVarianceWeights(normalized)
 
         let duration = max((frames.last?.timestamp ?? 0) - (frames.first?.timestamp ?? 0), 0.1)
         return MovementTemplate(
@@ -116,7 +119,7 @@ nonisolated final class FewShotRepetitionCounter {
             sourceFrameCount: frames.count,
             duration: duration,
             qualityScore: averageQuality,
-            vectors: normalized
+            vectors: weighted
         )
     }
 
@@ -528,6 +531,52 @@ nonisolated final class FewShotRepetitionCounter {
         }
     }
 
+    private static func applyFeatureVarianceWeights(_ vectors: [PoseFeatureVector], boost: Double = 1.5) -> [PoseFeatureVector] {
+        guard vectors.count > 1,
+              let featureCount = vectors.first?.values.count,
+              featureCount > 0
+        else {
+            return vectors
+        }
+
+        var means = Array(repeating: 0.0, count: featureCount)
+        for v in vectors {
+            for i in 0..<featureCount {
+                means[i] += v.values[i]
+            }
+        }
+        for i in 0..<featureCount {
+            means[i] /= Double(vectors.count)
+        }
+
+        var stds = Array(repeating: 0.0, count: featureCount)
+        for v in vectors {
+            for i in 0..<featureCount {
+                let diff = v.values[i] - means[i]
+                stds[i] += diff * diff
+            }
+        }
+        for i in 0..<featureCount {
+            stds[i] = sqrt(stds[i] / Double(vectors.count))
+        }
+
+        guard let maxStd = stds.max(), maxStd > 0.001 else {
+            return vectors
+        }
+
+        let varianceWeights: [Double] = stds.map { std in
+            1.0 + boost * (std / maxStd)
+        }
+
+        return vectors.map { v in
+            var boosted = v
+            for i in 0..<featureCount {
+                boosted.weights[i] *= varianceWeights[i]
+            }
+            return boosted
+        }
+    }
+
     private static let jointOrder: [PoseJointName] = [
         .leftShoulder,
         .rightShoulder,
@@ -554,8 +603,22 @@ nonisolated final class FewShotRepetitionCounter {
         (.rightHip, .rightShoulder, .rightWrist)
     ]
 
+    private static let leftArmLimbDirectionPairs: [(proximal: PoseJointName, distal: PoseJointName)] = [
+        (.leftShoulder, .leftElbow),
+        (.leftElbow, .leftWrist)
+    ]
+
+    private static let rightArmLimbDirectionPairs: [(proximal: PoseJointName, distal: PoseJointName)] = [
+        (.rightShoulder, .rightElbow),
+        (.rightElbow, .rightWrist)
+    ]
+
+    private static var limbDirectionFeatureCount: Int {
+        leftArmLimbDirectionPairs.count + rightArmLimbDirectionPairs.count
+    }
+
     private static var poseFeatureValueCount: Int {
-        (jointOrder.count * 3) + angleTriples.count
+        (jointOrder.count * 3) + angleTriples.count + limbDirectionFeatureCount
     }
 
     private static func featureVectors(from frames: [PoseFrame]) -> [PoseFeatureVector] {
@@ -598,7 +661,32 @@ nonisolated final class FewShotRepetitionCounter {
             weights.append(feature.weight)
         }
 
+        for feature in limbDirectionFeatures(in: frame) {
+            values.append(feature.value)
+            weights.append(feature.weight)
+        }
+
         return PoseFeatureVector(values: values, weights: weights)
+    }
+
+    private static func limbDirectionFeatures(in frame: PoseFrame) -> [ScalarFeature] {
+        var features: [ScalarFeature] = []
+
+        for pair in leftArmLimbDirectionPairs + rightArmLimbDirectionPairs {
+            guard let proximal = frame.joint(pair.proximal),
+                  let distal = frame.joint(pair.distal)
+            else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            let verticalOffset = distal.y - proximal.y
+            let weight = min(proximal.confidence, distal.confidence) * 0.75
+
+            features.append(ScalarFeature(value: verticalOffset, weight: weight))
+        }
+
+        return features
     }
 
     private static func angleFeatures(in frame: PoseFrame) -> [ScalarFeature] {
