@@ -564,15 +564,13 @@ nonisolated final class FewShotRepetitionCounter {
             return vectors
         }
 
-        let varianceWeights: [Double] = stds.map { std in
+        let varianceMultipliers: [Double] = stds.map { std in
             1.0 + boost * (std / maxStd)
         }
 
         return vectors.map { v in
             var boosted = v
-            for i in 0..<featureCount {
-                boosted.weights[i] *= varianceWeights[i]
-            }
+            boosted.varianceMultipliers = varianceMultipliers
             return boosted
         }
     }
@@ -613,8 +611,13 @@ nonisolated final class FewShotRepetitionCounter {
         (.rightElbow, .rightWrist)
     ]
 
+    private static let crossBodyAsymmetryPairs: [(left: PoseJointName, right: PoseJointName)] = [
+        (.leftWrist, .rightWrist),
+        (.leftElbow, .rightElbow)
+    ]
+
     private static var limbDirectionFeatureCount: Int {
-        leftArmLimbDirectionPairs.count + rightArmLimbDirectionPairs.count
+        leftArmLimbDirectionPairs.count + rightArmLimbDirectionPairs.count + crossBodyAsymmetryPairs.count
     }
 
     private static var poseFeatureValueCount: Int {
@@ -684,6 +687,20 @@ nonisolated final class FewShotRepetitionCounter {
             let weight = min(proximal.confidence, distal.confidence) * 0.75
 
             features.append(ScalarFeature(value: verticalOffset, weight: weight))
+        }
+
+        for (leftJoint, rightJoint) in crossBodyAsymmetryPairs {
+            guard let left = frame.joint(leftJoint),
+                  let right = frame.joint(rightJoint)
+            else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            let asymmetry = left.y - right.y
+            let weight = min(left.confidence, right.confidence) * 0.7
+
+            features.append(ScalarFeature(value: asymmetry, weight: weight))
         }
 
         return features
@@ -795,6 +812,11 @@ nonisolated final class FewShotRepetitionCounter {
 nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
     var values: [Double]
     var weights: [Double]
+    var varianceMultipliers: [Double] = []
+
+    static func == (lhs: PoseFeatureVector, rhs: PoseFeatureVector) -> Bool {
+        lhs.values == rhs.values && lhs.weights == rhs.weights
+    }
 
     func distance(to other: PoseFeatureVector, limitedTo valueLimit: Int? = nil) -> Double {
         let comparedCount: Int
@@ -811,13 +833,15 @@ nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
             return .infinity
         }
 
+        let hasMultipliers = varianceMultipliers.count == comparedCount
         var weightedSum = 0.0
         var totalWeight = 0.0
 
         for index in 0..<comparedCount {
             let weight = min(weights[index], other.weights[index])
             if weight > 0.08 {
-                weightedSum += abs(values[index] - other.values[index]) * weight
+                let varianceBoost = hasMultipliers ? varianceMultipliers[index] : 1.0
+                weightedSum += abs(values[index] - other.values[index]) * weight * varianceBoost
                 totalWeight += weight
             } else if max(weights[index], other.weights[index]) > 0.4 {
                 weightedSum += 0.35
@@ -843,6 +867,14 @@ nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
         let weights = zip(left.weights, right.weights).map { leftValue, rightValue in
             leftValue + ((rightValue - leftValue) * blend)
         }
-        return PoseFeatureVector(values: values, weights: weights)
+        let multipliers: [Double]
+        if left.varianceMultipliers.count == right.varianceMultipliers.count && !left.varianceMultipliers.isEmpty {
+            multipliers = zip(left.varianceMultipliers, right.varianceMultipliers).map { l, r in
+                l + ((r - l) * blend)
+            }
+        } else {
+            multipliers = []
+        }
+        return PoseFeatureVector(values: values, weights: weights, varianceMultipliers: multipliers)
     }
 }

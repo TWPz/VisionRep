@@ -168,6 +168,7 @@ struct WorkoutDashboardView: View {
                     model.performPrimaryAction()
                 }
                 .disabled(!primaryActionEnabled)
+                .tint(model.mode == .counting ? .red : .accentColor)
 
                 Button {
                     model.resetCalibration()
