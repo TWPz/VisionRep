@@ -33,31 +33,36 @@ nonisolated final class PoseFrameProcessor {
 
         do {
             try sequenceHandler.perform(
-                [bodyPose3DRequest, bodyPose2DRequest],
+                [bodyPose2DRequest, bodyPose3DRequest],
                 on: sampleBuffer,
                 orientation: .upMirrored
             )
+        } catch {
+            // 2D runs first, so its results may still be available even if 3D threw.
+            // Fall through to unified result extraction below instead of re-running inference.
+        }
 
-            let twoDimensionalObservation = bodyPose2DRequest.results?.max(by: { area(of: $0) < area(of: $1) })
+        let twoDimensionalObservation = bodyPose2DRequest.results?.max(by: { area(of: $0) < area(of: $1) })
 
-            if let threeDimensionalObservation = bodyPose3DRequest.results?.max(by: { $0.confidence < $1.confidence }),
-               let frame = makeThreeDimensionalFrame(
-                from: threeDimensionalObservation,
-                fallbackObservation: twoDimensionalObservation,
-                timestamp: timestamp
-               ) {
-                return makePoseResult(from: frame)
-            }
+        if let threeDimensionalObservation = bodyPose3DRequest.results?.max(by: { $0.confidence < $1.confidence }),
+           let frame = makeThreeDimensionalFrame(
+            from: threeDimensionalObservation,
+            fallbackObservation: twoDimensionalObservation,
+            timestamp: timestamp
+           ) {
+            return makePoseResult(from: frame)
+        }
 
-            guard let observation = twoDimensionalObservation else {
-                poseSmoother.reset()
-                return .noPose(timestamp)
-            }
+        guard let observation = twoDimensionalObservation else {
+            poseSmoother.reset()
+            return .noPose(timestamp)
+        }
 
+        do {
             let frame = try makeFrame(from: observation, timestamp: timestamp)
             return makePoseResult(from: frame)
         } catch {
-            return processTwoDimensionalFallback(sampleBuffer, timestamp: timestamp)
+            return .failed(error.localizedDescription)
         }
     }
 
@@ -141,29 +146,6 @@ nonisolated final class PoseFrameProcessor {
         return PoseFrame(timestamp: timestamp, joints: joints)
     }
 
-    private func processTwoDimensionalFallback(
-        _ sampleBuffer: CMSampleBuffer,
-        timestamp: TimeInterval
-    ) -> PoseProcessingResult {
-        do {
-            let handler = VNImageRequestHandler(
-                cmSampleBuffer: sampleBuffer,
-                orientation: .upMirrored,
-                options: [:]
-            )
-            try handler.perform([bodyPose2DRequest])
-
-            guard let observation = bodyPose2DRequest.results?.max(by: { area(of: $0) < area(of: $1) }) else {
-                poseSmoother.reset()
-                return .noPose(timestamp)
-            }
-
-            let frame = try makeFrame(from: observation, timestamp: timestamp)
-            return makePoseResult(from: frame)
-        } catch {
-            return .failed(error.localizedDescription)
-        }
-    }
 
     private func area(of observation: VNHumanBodyPoseObservation) -> Double {
         guard let points = try? observation.recognizedPoints(.all).values.filter({ $0.confidence >= minimumJointConfidence }),
