@@ -11,25 +11,29 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.visionrep.repetition.counter", qos: .userInitiated)
     private let stateLock = NSLock()
     private let counter = FewShotRepetitionCounter()
+    private let maxPendingFrameCount = 3
     private var isProcessing = false
-    private var pendingFrame: PendingFrame?
+    private var lastReportedRepetitions = 0
+    private var pendingFrames: [PendingFrame] = []
 
     func load(templates: [MovementTemplate]) {
-        discardPendingFrame()
+        discardPendingFrames()
         queue.async { [weak self] in
+            self?.lastReportedRepetitions = 0
             self?.counter.load(templates: templates)
         }
     }
 
     func resetCount() {
-        discardPendingFrame()
+        discardPendingFrames()
         queue.async { [weak self] in
+            self?.lastReportedRepetitions = 0
             self?.counter.resetCount()
         }
     }
 
     func clearOnlineTemplates() {
-        discardPendingFrame()
+        discardPendingFrames()
         queue.async { [weak self] in
             self?.counter.clearOnlineTemplates()
         }
@@ -40,7 +44,10 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
         stateLock.lock()
         if isProcessing {
-            pendingFrame = item
+            pendingFrames.append(item)
+            while pendingFrames.count > maxPendingFrameCount {
+                pendingFrames.removeFirst()
+            }
             stateLock.unlock()
             return
         }
@@ -54,22 +61,27 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     private func process(_ item: PendingFrame) {
         let update = counter.update(with: item.frame)
+        let countedNewRepetition = update.repetitions > lastReportedRepetitions
+        lastReportedRepetitions = update.repetitions
 
         DispatchQueue.main.async { [weak self] in
             self?.onUpdate?(update, item.quality)
         }
 
+        if countedNewRepetition {
+            discardPendingFrames()
+        }
         processNextPendingFrame()
     }
 
     private func processNextPendingFrame() {
         stateLock.lock()
-        guard let item = pendingFrame else {
+        guard !pendingFrames.isEmpty else {
             isProcessing = false
             stateLock.unlock()
             return
         }
-        pendingFrame = nil
+        let item = pendingFrames.removeFirst()
         stateLock.unlock()
 
         queue.async { [weak self] in
@@ -77,9 +89,9 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
         }
     }
 
-    private func discardPendingFrame() {
+    private func discardPendingFrames() {
         stateLock.lock()
-        pendingFrame = nil
+        pendingFrames.removeAll(keepingCapacity: true)
         stateLock.unlock()
     }
 }

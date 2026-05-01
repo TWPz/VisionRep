@@ -28,7 +28,7 @@ final class WorkoutSessionModel {
     var countingCountdownRemaining: Int?
     var voiceCommandStatus = ""
     var statusMessage = "Start the camera and keep your full body in frame."
-    var cameraFramingMode: CameraFramingMode = .centerStageTracking
+    var cameraFramingMode: CameraFramingMode = .widestView
 
     @ObservationIgnored private let frameBridge = PoseProcessingBridge()
     @ObservationIgnored private let templateBuilder = FewShotRepetitionCounter()
@@ -258,13 +258,18 @@ final class WorkoutSessionModel {
             latestPose = nil
             poseQuality = PoseQuality(trackedJointRatio: 0, requiredJointRatio: 0, averageConfidence: 0)
             if trainingCountdownRemaining == nil, countingCountdownRemaining == nil {
-                statusMessage = "No body detected. Step into frame."
+                updateStatus("No body detected. Step into frame.")
             }
         case .skipped:
             break
         case .failed(let message):
-            statusMessage = "Pose detection failed: \(message)"
+            updateStatus("Pose detection failed: \(message)")
         }
+    }
+
+    private func updateStatus(_ message: String) {
+        guard statusMessage != message else { return }
+        statusMessage = message
     }
 
     private func applyCameraState(_ state: CameraState) {
@@ -313,7 +318,7 @@ final class WorkoutSessionModel {
                 return
             }
             guard quality.score >= 0.48 else {
-                statusMessage = quality.guidance
+                updateStatus(quality.guidance)
                 return
             }
             activeCaptureFrames.append(frame)
@@ -326,7 +331,7 @@ final class WorkoutSessionModel {
             liveRepetitionCounter.submit(frame, quality: quality)
         default:
             if quality.score < 0.58 {
-                statusMessage = quality.guidance
+                updateStatus(quality.guidance)
             }
         }
     }
@@ -340,11 +345,11 @@ final class WorkoutSessionModel {
         matchConfidence = update.confidence
         latestMatcherScore = update.bestScore
         if update.confidence > 0.72 {
-            statusMessage = "Movement matched template \(update.matchedTemplateIndex ?? 0)."
+            updateStatus("Movement matched template \(update.matchedTemplateIndex ?? 0).")
         } else if quality.score < 0.58 {
-            statusMessage = quality.guidance
+            updateStatus(quality.guidance)
         } else {
-            statusMessage = "Track the full recorded movement path."
+            updateStatus("Track the full recorded movement path.")
         }
     }
 

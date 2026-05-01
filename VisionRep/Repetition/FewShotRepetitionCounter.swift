@@ -108,6 +108,7 @@ nonisolated final class FewShotRepetitionCounter {
         guard frames.count >= 20 else { return nil }
         let normalized = resample(Self.featureVectors(from: frames), targetCount: sampleCount)
         guard normalized.count == sampleCount else { return nil }
+        let weighted = Self.applyFeatureVarianceWeights(normalized)
 
         let duration = max((frames.last?.timestamp ?? 0) - (frames.first?.timestamp ?? 0), 0.1)
         return MovementTemplate(
@@ -116,7 +117,7 @@ nonisolated final class FewShotRepetitionCounter {
             sourceFrameCount: frames.count,
             duration: duration,
             qualityScore: averageQuality,
-            vectors: normalized
+            vectors: weighted
         )
     }
 
@@ -141,11 +142,21 @@ nonisolated final class FewShotRepetitionCounter {
         confidence = confidence(for: candidate)
 
         let cooldownElapsed = frame.timestamp - lastCountTimestamp > completionCooldown
-        if let candidate, candidate.score <= candidate.acceptanceThreshold, cooldownElapsed {
-            rememberPendingCompletion(candidate, now: frame.timestamp)
+        let immediateCandidate = immediateCompletionCandidate(
+            from: candidate,
+            currentFrame: frame,
+            cooldownElapsed: cooldownElapsed
+        )
+        let completedCandidate: Candidate?
+        if let immediateCandidate {
+            completedCandidate = immediateCandidate
+        } else {
+            if let candidate, candidate.score <= candidate.acceptanceThreshold, cooldownElapsed {
+                rememberPendingCompletion(candidate, now: frame.timestamp)
+            }
+            completedCandidate = completedPendingCandidate(with: frame)
         }
 
-        let completedCandidate = completedPendingCandidate(with: frame)
         if let completedCandidate, cooldownElapsed {
             repetitions += 1
             lastCountTimestamp = frame.timestamp
@@ -176,6 +187,7 @@ nonisolated final class FewShotRepetitionCounter {
             return nil
         }
 
+        let bufferPoseVectors = buffer.map { Self.vector(from: $0) }
         var best: Candidate?
 
         for record in matchingTemplates {
@@ -190,11 +202,12 @@ nonisolated final class FewShotRepetitionCounter {
             }
 
             for length in candidateLengths {
-                let segment = Array(buffer.suffix(length))
-                guard segmentDuration(segment) >= minimumCandidateDuration(for: template) else {
+                let segmentSlice = buffer.suffix(length)
+                guard segmentDuration(segmentSlice) >= minimumCandidateDuration(for: template) else {
                     continue
                 }
-                let vectors = resample(Self.featureVectors(from: segment), targetCount: sampleCount)
+                let segmentVectors = Self.featureVectors(fromPoseVectors: bufferPoseVectors.suffix(length))
+                let vectors = resample(segmentVectors, targetCount: sampleCount)
                 let candidateMovement = Self.movementMagnitude(vectors)
                 guard candidateMovement >= minimumCandidateMovement(for: template) else {
                     continue
@@ -206,7 +219,7 @@ nonisolated final class FewShotRepetitionCounter {
 
                 let anchorScore = closestAnchorScore(
                     to: vectors,
-                    duration: segmentDuration(segment),
+                    duration: segmentDuration(segmentSlice),
                     movement: candidateMovement
                 )
 
@@ -225,10 +238,10 @@ nonisolated final class FewShotRepetitionCounter {
                         source: record.source,
                         template: template,
                         acceptanceThreshold: candidateThreshold,
-                        segment: segment,
+                        segment: Array(segmentSlice),
                         vectors: vectors,
                         anchorScore: anchorScore,
-                        averageQuality: Self.averageJointConfidence(in: segment)
+                        averageQuality: Self.averageJointConfidence(in: segmentSlice)
                     )
                 }
             }
@@ -286,6 +299,10 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func segmentDuration(_ segment: [PoseFrame]) -> TimeInterval {
+        segmentDuration(segment[...])
+    }
+
+    private func segmentDuration(_ segment: ArraySlice<PoseFrame>) -> TimeInterval {
         guard let first = segment.first, let last = segment.last else {
             return 0
         }
@@ -320,11 +337,43 @@ nonisolated final class FewShotRepetitionCounter {
         }
     }
 
+    private func immediateCompletionCandidate(
+        from candidate: Candidate?,
+        currentFrame frame: PoseFrame,
+        cooldownElapsed: Bool
+    ) -> Candidate? {
+        guard let candidate,
+              cooldownElapsed,
+              candidate.score <= candidate.acceptanceThreshold,
+              completionCandidateHasEnoughCoverage(candidate),
+              candidateCompletesImmediately(candidate, with: frame)
+        else {
+            return nil
+        }
+
+        return candidate
+    }
+
     private func completedPendingCandidate(with frame: PoseFrame) -> Candidate? {
         guard let pendingCompletion else { return nil }
         guard completionPoseMatches(frame, candidate: pendingCompletion.candidate) else { return nil }
         guard completionPoseIsStable() else { return nil }
         return pendingCompletion.candidate
+    }
+
+    private func candidateCompletesImmediately(_ candidate: Candidate, with frame: PoseFrame) -> Bool {
+        guard completionPoseMatches(frame, candidate: candidate),
+              let candidateEndVector = candidate.vectors.last,
+              let templateEndVector = candidate.template.vectors.last
+        else {
+            return false
+        }
+
+        let endPoseDistance = candidateEndVector.distance(
+            to: templateEndVector,
+            limitedTo: Self.poseFeatureValueCount
+        )
+        return endPoseDistance <= completionPoseThreshold(for: candidate.template)
     }
 
     private func expirePendingCompletion(now: TimeInterval) {
@@ -338,8 +387,7 @@ nonisolated final class FewShotRepetitionCounter {
 
     private func completionPoseMatches(_ frame: PoseFrame, candidate: Candidate) -> Bool {
         guard let endVector = candidate.template.vectors.last else { return false }
-        let recentFrames = Array((buffer + [frame]).suffix(2))
-        let currentVector = Self.featureVectors(from: recentFrames).last ?? Self.vector(from: frame)
+        let currentVector = Self.vector(from: frame)
         let endPoseDistance = currentVector.distance(to: endVector, limitedTo: Self.poseFeatureValueCount)
         return endPoseDistance <= completionPoseThreshold(for: candidate.template)
     }
@@ -406,6 +454,10 @@ nonisolated final class FewShotRepetitionCounter {
             return false
         }
 
+        guard Self.depthGatePasses(vectors, template: template, acceptanceThreshold: acceptanceThreshold) else {
+            return false
+        }
+
         let velocityDistance = Self.distance(vectors, template.vectors)
         return velocityDistance <= max(acceptanceThreshold * 1.25, acceptanceThreshold + 0.05)
     }
@@ -445,11 +497,7 @@ nonisolated final class FewShotRepetitionCounter {
         guard !isDuplicateOnlineTemplate(candidate.vectors) else {
             return
         }
-        guard let template = makeTemplate(
-            index: nextOnlineTemplateIndex,
-            frames: candidate.segment,
-            averageQuality: candidate.averageQuality
-        ) else {
+        guard let template = makeOnlineTemplate(from: candidate) else {
             return
         }
 
@@ -474,6 +522,23 @@ nonisolated final class FewShotRepetitionCounter {
         return onlineTemplates.contains { record in
             Self.distance(vectors, record.template.vectors) <= duplicateDistance
         }
+    }
+
+    private func makeOnlineTemplate(from candidate: Candidate) -> MovementTemplate? {
+        guard candidate.vectors.count == sampleCount, !candidate.segment.isEmpty else {
+            return nil
+        }
+
+        let weighted = Self.applyFeatureVarianceWeights(candidate.vectors)
+        let duration = segmentDuration(candidate.segment)
+        return MovementTemplate(
+            index: nextOnlineTemplateIndex,
+            capturedAt: Date(),
+            sourceFrameCount: candidate.segment.count,
+            duration: max(duration, 0.1),
+            qualityScore: candidate.averageQuality,
+            vectors: weighted
+        )
     }
 
     private func evictWeakOnlineTemplatesIfNeeded() {
@@ -528,6 +593,48 @@ nonisolated final class FewShotRepetitionCounter {
         }
     }
 
+    private static func applyFeatureVarianceWeights(_ vectors: [PoseFeatureVector], boost: Double = 0.75) -> [PoseFeatureVector] {
+        guard vectors.count > 1,
+              let featureCount = vectors.first?.values.count,
+              featureCount > 0
+        else {
+            return vectors
+        }
+
+        var means = Array(repeating: 0.0, count: featureCount)
+        for vector in vectors {
+            for index in 0..<min(featureCount, vector.values.count) {
+                means[index] += vector.values[index]
+            }
+        }
+        for index in 0..<featureCount {
+            means[index] /= Double(vectors.count)
+        }
+
+        var standardDeviations = Array(repeating: 0.0, count: featureCount)
+        for vector in vectors {
+            for index in 0..<min(featureCount, vector.values.count) {
+                let difference = vector.values[index] - means[index]
+                standardDeviations[index] += difference * difference
+            }
+        }
+        for index in 0..<featureCount {
+            standardDeviations[index] = sqrt(standardDeviations[index] / Double(vectors.count))
+        }
+
+        guard let maxStandardDeviation = standardDeviations.max(), maxStandardDeviation > 0.001 else {
+            return vectors
+        }
+
+        let multipliers = standardDeviations.map { standardDeviation in
+            min(2.0, 1.0 + (boost * (standardDeviation / maxStandardDeviation)))
+        }
+
+        return vectors.map { vector in
+            PoseFeatureVector(values: vector.values, weights: vector.weights, varianceMultipliers: multipliers)
+        }
+    }
+
     private static let jointOrder: [PoseJointName] = [
         .leftShoulder,
         .rightShoulder,
@@ -554,15 +661,70 @@ nonisolated final class FewShotRepetitionCounter {
         (.rightHip, .rightShoulder, .rightWrist)
     ]
 
+    private static let depthRelationPairs: [(reference: PoseJointName, target: PoseJointName)] = [
+        (.root, .leftElbow),
+        (.root, .rightElbow),
+        (.root, .leftWrist),
+        (.root, .rightWrist),
+        (.root, .leftKnee),
+        (.root, .rightKnee),
+        (.root, .leftAnkle),
+        (.root, .rightAnkle)
+    ]
+
+    private static let depthDirectionPairs: [(proximal: PoseJointName, distal: PoseJointName)] = [
+        (.leftShoulder, .leftElbow),
+        (.rightShoulder, .rightElbow),
+        (.leftElbow, .leftWrist),
+        (.rightElbow, .rightWrist),
+        (.leftHip, .leftKnee),
+        (.rightHip, .rightKnee),
+        (.leftKnee, .leftAnkle),
+        (.rightKnee, .rightAnkle)
+    ]
+
+    private static let depthAsymmetryPairs: [(left: PoseJointName, right: PoseJointName)] = [
+        (.leftElbow, .rightElbow),
+        (.leftWrist, .rightWrist),
+        (.leftKnee, .rightKnee),
+        (.leftAnkle, .rightAnkle)
+    ]
+
+    private static var rawPoseFeatureValueCount: Int {
+        jointOrder.count * 3
+    }
+
+    private static var angleFeatureValueCount: Int {
+        angleTriples.count
+    }
+
+    private static var depthDerivedFeatureValueCount: Int {
+        depthRelationPairs.count + depthDirectionPairs.count + depthAsymmetryPairs.count
+    }
+
+    private static var depthDerivedFeatureStartIndex: Int {
+        rawPoseFeatureValueCount + angleFeatureValueCount
+    }
+
+    private static var depthSensitiveFeatureIndices: [Int] {
+        let rawDepthIndices = jointOrder.indices.map { ($0 * 3) + 2 }
+        let derivedDepthIndices = (0..<depthDerivedFeatureValueCount).map { depthDerivedFeatureStartIndex + $0 }
+        return rawDepthIndices + derivedDepthIndices
+    }
+
     private static var poseFeatureValueCount: Int {
-        (jointOrder.count * 3) + angleTriples.count
+        rawPoseFeatureValueCount + angleFeatureValueCount + depthDerivedFeatureValueCount
     }
 
     private static func featureVectors(from frames: [PoseFrame]) -> [PoseFeatureVector] {
+        let poseVectors = frames.map { vector(from: $0) }
+        return featureVectors(fromPoseVectors: poseVectors[...])
+    }
+
+    private static func featureVectors(fromPoseVectors poseVectors: ArraySlice<PoseFeatureVector>) -> [PoseFeatureVector] {
         var previousPoseVector: PoseFeatureVector?
 
-        return frames.map { frame in
-            let poseVector = vector(from: frame)
+        return poseVectors.map { poseVector in
             let velocity = previousPoseVector.map { previous in
                 velocityFeatures(from: previous, to: poseVector)
             } ?? zeroVelocityFeatures()
@@ -582,7 +744,7 @@ nonisolated final class FewShotRepetitionCounter {
                 values.append(joint.z ?? 0)
                 weights.append(joint.confidence)
                 weights.append(joint.confidence)
-                weights.append(joint.z == nil ? 0 : joint.confidence * 0.35)
+                weights.append(joint.z == nil ? 0 : joint.confidence * 0.72)
             } else {
                 values.append(0)
                 values.append(0)
@@ -598,7 +760,80 @@ nonisolated final class FewShotRepetitionCounter {
             weights.append(feature.weight)
         }
 
+        for feature in depthFeatures(in: frame) {
+            values.append(feature.value)
+            weights.append(feature.weight)
+        }
+
         return PoseFeatureVector(values: values, weights: weights)
+    }
+
+    private static func depthFeatures(in frame: PoseFrame) -> [ScalarFeature] {
+        var features: [ScalarFeature] = []
+        features.reserveCapacity(depthDerivedFeatureValueCount)
+
+        for pair in depthRelationPairs {
+            guard let reference = frame.joint(pair.reference),
+                  let target = frame.joint(pair.target),
+                  let referenceDepth = reference.z,
+                  let targetDepth = target.z
+            else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            features.append(
+                ScalarFeature(
+                    value: targetDepth - referenceDepth,
+                    weight: min(reference.confidence, target.confidence) * 0.9
+                )
+            )
+        }
+
+        for pair in depthDirectionPairs {
+            guard let proximal = frame.joint(pair.proximal),
+                  let distal = frame.joint(pair.distal),
+                  proximal.z != nil,
+                  distal.z != nil
+            else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            let direction = vector(from: proximal, to: distal)
+            let length = magnitude(direction)
+            guard length > 0.0001 else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            features.append(
+                ScalarFeature(
+                    value: direction.z / length,
+                    weight: min(proximal.confidence, distal.confidence) * 0.85
+                )
+            )
+        }
+
+        for pair in depthAsymmetryPairs {
+            guard let left = frame.joint(pair.left),
+                  let right = frame.joint(pair.right),
+                  let leftDepth = left.z,
+                  let rightDepth = right.z
+            else {
+                features.append(ScalarFeature(value: 0, weight: 0))
+                continue
+            }
+
+            features.append(
+                ScalarFeature(
+                    value: leftDepth - rightDepth,
+                    weight: min(left.confidence, right.confidence) * 0.75
+                )
+            )
+        }
+
+        return features
     }
 
     private static func angleFeatures(in frame: PoseFrame) -> [ScalarFeature] {
@@ -695,7 +930,128 @@ nonisolated final class FewShotRepetitionCounter {
         return total / Double(vectors.count - 1)
     }
 
+    private static func depthGatePasses(
+        _ vectors: [PoseFeatureVector],
+        template: MovementTemplate,
+        acceptanceThreshold: Double
+    ) -> Bool {
+        let templateCoverage = depthCoverage(in: template.vectors)
+        guard templateCoverage >= 0.42 else {
+            return true
+        }
+
+        let candidateCoverage = depthCoverage(in: vectors)
+        guard candidateCoverage >= max(0.35, templateCoverage * 0.65) else {
+            return false
+        }
+
+        let templateMotion = depthMotionMagnitude(template.vectors)
+        if templateMotion >= 0.018 {
+            let candidateMotion = depthMotionMagnitude(vectors)
+            guard candidateMotion >= templateMotion * 0.42 else {
+                return false
+            }
+        }
+
+        let averageDistance = depthDistance(vectors, template.vectors)
+        guard averageDistance <= max(min(acceptanceThreshold * 1.35, 0.26), 0.08) else {
+            return false
+        }
+
+        let checkpoints = [
+            vectors.count / 4,
+            vectors.count / 2,
+            (vectors.count * 3) / 4
+        ]
+        let worstCheckpointDistance = checkpoints.map { checkpoint in
+            depthDistance(vectors[checkpoint], template.vectors[checkpoint])
+        }.max() ?? .infinity
+
+        return worstCheckpointDistance <= max(min(acceptanceThreshold * 1.65, 0.32), 0.12)
+    }
+
+    private static func depthCoverage(in vectors: [PoseFeatureVector]) -> Double {
+        guard !vectors.isEmpty else { return 0 }
+        var available = 0
+        var possible = 0
+
+        for vector in vectors {
+            for index in depthSensitiveFeatureIndices where index < vector.weights.count {
+                possible += 1
+                if vector.weights[index] > 0.45 {
+                    available += 1
+                }
+            }
+        }
+
+        guard possible > 0 else { return 0 }
+        return Double(available) / Double(possible)
+    }
+
+    private static func depthMotionMagnitude(_ vectors: [PoseFeatureVector]) -> Double {
+        guard vectors.count > 1 else { return 0 }
+        var total = 0.0
+        var sampleCount = 0
+
+        for (previous, current) in zip(vectors, vectors.dropFirst()) {
+            for index in depthSensitiveFeatureIndices
+            where index < previous.values.count &&
+                index < current.values.count &&
+                index < previous.weights.count &&
+                index < current.weights.count {
+                let weight = min(previous.weights[index], current.weights[index])
+                guard weight > 0.45 else { continue }
+                total += abs(current.values[index] - previous.values[index]) * weight
+                sampleCount += 1
+            }
+        }
+
+        guard sampleCount > 0 else { return 0 }
+        return total / Double(sampleCount)
+    }
+
+    private static func depthDistance(_ left: [PoseFeatureVector], _ right: [PoseFeatureVector]) -> Double {
+        guard left.count == right.count, !left.isEmpty else { return .infinity }
+        var total = 0.0
+        var totalWeight = 0.0
+
+        for (leftVector, rightVector) in zip(left, right) {
+            let distance = depthDistance(leftVector, rightVector)
+            guard distance.isFinite else { continue }
+            total += distance
+            totalWeight += 1
+        }
+
+        guard totalWeight > 0 else { return .infinity }
+        return total / totalWeight
+    }
+
+    private static func depthDistance(_ left: PoseFeatureVector, _ right: PoseFeatureVector) -> Double {
+        let comparedCount = min(
+            left.values.count,
+            right.values.count,
+            left.weights.count,
+            right.weights.count
+        )
+        var total = 0.0
+        var totalWeight = 0.0
+
+        for index in depthSensitiveFeatureIndices where index < comparedCount {
+            let weight = min(left.weights[index], right.weights[index])
+            guard weight > 0.45 else { continue }
+            total += abs(left.values[index] - right.values[index]) * weight
+            totalWeight += weight
+        }
+
+        guard totalWeight > 0 else { return .infinity }
+        return total / totalWeight
+    }
+
     private static func averageJointConfidence(in segment: [PoseFrame]) -> Double {
+        averageJointConfidence(in: segment[...])
+    }
+
+    private static func averageJointConfidence(in segment: ArraySlice<PoseFrame>) -> Double {
         let confidences = segment.flatMap { frame in
             frame.joints.values.map(\.confidence)
         }
@@ -707,16 +1063,36 @@ nonisolated final class FewShotRepetitionCounter {
 nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
     var values: [Double]
     var weights: [Double]
+    var varianceMultipliers: [Double] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case values
+        case weights
+        case varianceMultipliers
+    }
+
+    init(values: [Double], weights: [Double], varianceMultipliers: [Double] = []) {
+        self.values = values
+        self.weights = weights
+        self.varianceMultipliers = varianceMultipliers
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        values = try container.decode([Double].self, forKey: .values)
+        weights = try container.decode([Double].self, forKey: .weights)
+        varianceMultipliers = try container.decodeIfPresent([Double].self, forKey: .varianceMultipliers) ?? []
+    }
 
     func distance(to other: PoseFeatureVector, limitedTo valueLimit: Int? = nil) -> Double {
         let comparedCount: Int
         if let valueLimit {
             comparedCount = min(valueLimit, values.count, other.values.count, weights.count, other.weights.count)
         } else {
-            guard values.count == other.values.count, weights.count == other.weights.count else {
+            comparedCount = min(values.count, other.values.count, weights.count, other.weights.count)
+            guard comparedCount > 0 else {
                 return .infinity
             }
-            comparedCount = values.count
         }
 
         guard comparedCount > 0 else {
@@ -728,12 +1104,14 @@ nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
 
         for index in 0..<comparedCount {
             let weight = min(weights[index], other.weights[index])
+            let varianceBoost = max(varianceMultiplier(at: index), other.varianceMultiplier(at: index))
             if weight > 0.08 {
-                weightedSum += abs(values[index] - other.values[index]) * weight
-                totalWeight += weight
+                let effectiveWeight = weight * varianceBoost
+                weightedSum += abs(values[index] - other.values[index]) * effectiveWeight
+                totalWeight += effectiveWeight
             } else if max(weights[index], other.weights[index]) > 0.4 {
-                weightedSum += 0.35
-                totalWeight += 1
+                weightedSum += 0.35 * varianceBoost
+                totalWeight += varianceBoost
             }
         }
 
@@ -744,7 +1122,8 @@ nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
     func appending(_ other: PoseFeatureVector) -> PoseFeatureVector {
         PoseFeatureVector(
             values: values + other.values,
-            weights: weights + other.weights
+            weights: weights + other.weights,
+            varianceMultipliers: mergedMultipliers(with: other)
         )
     }
 
@@ -755,6 +1134,29 @@ nonisolated struct PoseFeatureVector: Codable, Equatable, Sendable {
         let weights = zip(left.weights, right.weights).map { leftValue, rightValue in
             leftValue + ((rightValue - leftValue) * blend)
         }
-        return PoseFeatureVector(values: values, weights: weights)
+        let multipliers: [Double]
+        if left.varianceMultipliers.count == right.varianceMultipliers.count, !left.varianceMultipliers.isEmpty {
+            multipliers = zip(left.varianceMultipliers, right.varianceMultipliers).map { leftValue, rightValue in
+                leftValue + ((rightValue - leftValue) * blend)
+            }
+        } else {
+            multipliers = []
+        }
+        return PoseFeatureVector(values: values, weights: weights, varianceMultipliers: multipliers)
+    }
+
+    private func varianceMultiplier(at index: Int) -> Double {
+        guard index < varianceMultipliers.count else { return 1.0 }
+        return max(0.25, varianceMultipliers[index])
+    }
+
+    private func mergedMultipliers(with other: PoseFeatureVector) -> [Double] {
+        if varianceMultipliers.isEmpty, other.varianceMultipliers.isEmpty {
+            return []
+        }
+
+        let leftMultipliers = varianceMultipliers.isEmpty ? Array(repeating: 1.0, count: values.count) : varianceMultipliers
+        let rightMultipliers = other.varianceMultipliers.isEmpty ? Array(repeating: 1.0, count: other.values.count) : other.varianceMultipliers
+        return leftMultipliers + rightMultipliers
     }
 }

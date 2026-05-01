@@ -17,7 +17,8 @@ rg -q 'AVCaptureDevice\.centerStageControlMode = \.cooperative' "$camera_file"
 rg -q 'AVCaptureDevice\.isCenterStageEnabled = true' "$camera_file"
 rg -q 'device.videoZoomFactor = device.minAvailableVideoZoomFactor' "$camera_file"
 
-rg -q 'var cameraFramingMode: CameraFramingMode' "$model_file"
+rg -q 'private var framingMode: CameraFramingMode = \.widestView' "$camera_file"
+rg -q 'var cameraFramingMode: CameraFramingMode = \.widestView' "$model_file"
 rg -q 'func toggleCameraFramingMode' "$model_file"
 rg -q 'camera\.setFramingMode\(nextMode\)' "$model_file"
 

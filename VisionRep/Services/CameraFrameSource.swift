@@ -23,7 +23,8 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
     private let videoQueue = DispatchQueue(label: "com.visionrep.camera.frames", qos: .userInitiated)
     private let output = AVCaptureVideoDataOutput()
     private let targetCameraFramesPerSecond: Double = 30
-    private var framingMode: CameraFramingMode = .centerStageTracking
+    private let cameraPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    private var framingMode: CameraFramingMode = .widestView
     private var isConfigured = false
 
     func requestAccessAndConfigure(completion: @escaping (CameraState) -> Void) {
@@ -155,7 +156,7 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
 
         output.alwaysDiscardsLateVideoFrames = true
         output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String: cameraPixelFormat
         ]
         output.setSampleBufferDelegate(self, queue: videoQueue)
 

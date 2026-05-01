@@ -5,11 +5,17 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 counter_file="$repo_root/VisionRep/Repetition/FewShotRepetitionCounter.swift"
 
 rg -q 'pendingCompletion' "$counter_file"
+rg -q 'immediateCompletionCandidate' "$counter_file"
+rg -q 'candidateCompletesImmediately' "$counter_file"
 rg -q 'completionPoseMatches' "$counter_file"
 rg -q 'completionPoseIsStable' "$counter_file"
 rg -q 'completeLengthRange' "$counter_file"
 rg -q 'minimumCandidateDuration' "$counter_file"
 rg -q '2\.4' "$counter_file"
+if rg -q --fixed-strings 'buffer + [frame]' "$counter_file"; then
+    echo "completion pose check should not allocate by appending the current frame twice" >&2
+    exit 1
+fi
 
 tmp_file="$(mktemp /tmp/visionrep-live-count-completion-XXXXXX.swift)"
 trap 'rm -f "$tmp_file"' EXIT
@@ -80,19 +86,19 @@ for frame in slowRep.dropLast(4) {
 
 expect(latest.repetitions == 0, "live count should not increment before the final pose is reached")
 
-for frame in slowRep.suffix(4) + holdEndPose(after: slowRep, count: 3) {
+for frame in slowRep.suffix(4) {
     latest = counter.update(with: frame)
 }
 
-expect(latest.repetitions == 1, "slower complete live rep should count after the action is done")
+expect(latest.repetitions == 1, "slower complete live rep should count on the final action frame without waiting for held end-pose frames")
 expect(counter.onlineTemplateCount == 1, "completed counted rep should still be available for online adaptation")
 
 let secondRep = makeRep(start: 120, frameCount: 36, amplitude: 8.0)
-for frame in secondRep + holdEndPose(after: secondRep, count: 2) {
+for frame in secondRep {
     latest = counter.update(with: frame)
 }
 
-expect(latest.repetitions == 2, "faster complete live rep should also count once finished")
+expect(latest.repetitions == 2, "faster complete live rep should also count as soon as the action finishes")
 
 print("live count completion and timing tolerance verified")
 SWIFT
