@@ -9,6 +9,8 @@ rg -q 'immediateCompletionCandidate' "$counter_file"
 rg -q 'candidateCompletesImmediately' "$counter_file"
 rg -q 'completionPoseMatches' "$counter_file"
 rg -q 'completionPoseIsStable' "$counter_file"
+rg -q 'minimumCompletionConfidence' "$counter_file"
+rg -q 'completionConfidencePasses' "$counter_file"
 rg -q 'completeLengthRange' "$counter_file"
 rg -q 'minimumCandidateDuration' "$counter_file"
 rg -q '2\.4' "$counter_file"
@@ -99,6 +101,15 @@ for frame in secondRep {
 }
 
 expect(latest.repetitions == 2, "faster complete live rep should also count as soon as the action finishes")
+
+let lowConfidenceCounter = FewShotRepetitionCounter()
+lowConfidenceCounter.load(templates: templates)
+var lowConfidenceUpdate = CountUpdate(repetitions: 0, confidence: 0, bestScore: .infinity, matchedTemplateIndex: nil)
+for frame in makeRep(start: 200, frameCount: 50, amplitude: 5.0) {
+    lowConfidenceUpdate = lowConfidenceCounter.update(with: frame)
+}
+
+expect(lowConfidenceUpdate.repetitions == 0, "completed action below the confidence gate must not increment the rep count")
 
 print("live count completion and timing tolerance verified")
 SWIFT

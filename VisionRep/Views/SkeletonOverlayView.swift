@@ -11,6 +11,7 @@ struct SkeletonOverlayView: View {
     var body: some View {
         Canvas { context, size in
             guard let pose else { return }
+            let layout = AspectFillLayout(size: size, sourceAspectRatio: sourceAspectRatio)
 
             for connection in SkeletonConnection.all {
                 guard let start = pose.joint(connection.start),
@@ -21,8 +22,8 @@ struct SkeletonOverlayView: View {
                     continue
                 }
 
-                let startPoint = aspectFillPoint(start, in: size)
-                let endPoint = aspectFillPoint(end, in: size)
+                let startPoint = layout.point(for: start, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
+                let endPoint = layout.point(for: end, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
                 guard isDrawable(startPoint, in: size), isDrawable(endPoint, in: size) else {
                     continue
                 }
@@ -38,7 +39,7 @@ struct SkeletonOverlayView: View {
             }
 
             for (jointName, joint) in pose.joints where joint.confidence >= minimumJointConfidence {
-                let point = aspectFillPoint(joint, in: size)
+                let point = layout.point(for: joint, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
                 guard isDrawable(point, in: size) else { continue }
 
                 let radius = jointRadius(in: size, confidence: joint.confidence)
@@ -51,37 +52,49 @@ struct SkeletonOverlayView: View {
         .accessibilityHidden(true)
     }
 
-    private func aspectFillPoint(_ joint: PoseJoint, in size: CGSize) -> CGPoint {
-        guard size.width > 0, size.height > 0, sourceAspectRatio > 0 else {
-            return .zero
+    private struct AspectFillLayout {
+        let usesHeightConstraint: Bool
+        let drawnDimension: CGFloat
+        let xOffset: CGFloat
+        let yOffset: CGFloat
+        let size: CGSize
+
+        init(size: CGSize, sourceAspectRatio: CGFloat) {
+            self.size = size
+            let viewAspectRatio = size.width / size.height
+            if viewAspectRatio > sourceAspectRatio {
+                usesHeightConstraint = true
+                drawnDimension = size.width / sourceAspectRatio
+                xOffset = 0
+                yOffset = (size.height - drawnDimension) / 2
+            } else {
+                usesHeightConstraint = false
+                drawnDimension = size.height * sourceAspectRatio
+                xOffset = (size.width - drawnDimension) / 2
+                yOffset = 0
+            }
         }
 
-        let previewPoint = previewNormalizedPoint(from: joint)
-        let normalizedX = CGFloat(previewPoint.x)
-        let normalizedY = CGFloat(1 - previewPoint.y)
-        let viewAspectRatio = size.width / size.height
+        func point(for joint: PoseJoint, rotation: Bool, mirrored: Bool) -> CGPoint {
+            var previewX: CGFloat
+            var previewY: CGFloat
+            if rotation {
+                (previewX, previewY) = (1 - CGFloat(joint.y), CGFloat(joint.x))
+            } else {
+                (previewX, previewY) = (CGFloat(joint.x), CGFloat(joint.y))
+            }
+            if mirrored {
+                previewX = 1 - previewX
+            }
 
-        if viewAspectRatio > sourceAspectRatio {
-            let drawnHeight = size.width / sourceAspectRatio
-            let yOffset = (size.height - drawnHeight) / 2
-            return CGPoint(x: normalizedX * size.width, y: yOffset + (normalizedY * drawnHeight))
-        } else {
-            let drawnWidth = size.height * sourceAspectRatio
-            let xOffset = (size.width - drawnWidth) / 2
-            return CGPoint(x: xOffset + (normalizedX * drawnWidth), y: normalizedY * size.height)
+            let normalizedX = previewX
+            let normalizedY = 1 - previewY
+            if usesHeightConstraint {
+                return CGPoint(x: normalizedX * size.width, y: yOffset + normalizedY * drawnDimension)
+            } else {
+                return CGPoint(x: xOffset + normalizedX * drawnDimension, y: normalizedY * size.height)
+            }
         }
-    }
-
-    private func previewNormalizedPoint(from joint: PoseJoint) -> CGPoint {
-        let rotatedPoint: CGPoint
-        if rotatesLandscapeSourceToPortrait {
-            rotatedPoint = CGPoint(x: 1 - joint.y, y: joint.x)
-        } else {
-            rotatedPoint = CGPoint(x: joint.x, y: joint.y)
-        }
-
-        guard mirrorsFrontCameraPreview else { return rotatedPoint }
-        return CGPoint(x: 1 - rotatedPoint.x, y: rotatedPoint.y)
     }
 
     private func isDrawable(_ point: CGPoint, in size: CGSize) -> Bool {

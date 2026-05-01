@@ -8,6 +8,50 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
     var duration: TimeInterval
     var qualityScore: Double
     var vectors: [PoseFeatureVector]
+    var depthCoverage: Double
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case index
+        case capturedAt
+        case sourceFrameCount
+        case duration
+        case qualityScore
+        case vectors
+        case depthCoverage
+    }
+
+    init(
+        id: UUID = UUID(),
+        index: Int,
+        capturedAt: Date,
+        sourceFrameCount: Int,
+        duration: TimeInterval,
+        qualityScore: Double,
+        vectors: [PoseFeatureVector],
+        depthCoverage: Double = 0
+    ) {
+        self.id = id
+        self.index = index
+        self.capturedAt = capturedAt
+        self.sourceFrameCount = sourceFrameCount
+        self.duration = duration
+        self.qualityScore = qualityScore
+        self.vectors = vectors
+        self.depthCoverage = depthCoverage
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        index = try container.decode(Int.self, forKey: .index)
+        capturedAt = try container.decode(Date.self, forKey: .capturedAt)
+        sourceFrameCount = try container.decode(Int.self, forKey: .sourceFrameCount)
+        duration = try container.decode(TimeInterval.self, forKey: .duration)
+        qualityScore = try container.decode(Double.self, forKey: .qualityScore)
+        vectors = try container.decode([PoseFeatureVector].self, forKey: .vectors)
+        depthCoverage = try container.decodeIfPresent(Double.self, forKey: .depthCoverage) ?? 0
+    }
 }
 
 nonisolated struct CountUpdate: Equatable, Sendable {
@@ -28,6 +72,7 @@ nonisolated final class FewShotRepetitionCounter {
     private let sampleCount = 48
     private let maxOnlineTemplateCount = 4
     private let onlinePromotionConfidenceThreshold = 0.85
+    private let minimumCompletionConfidence = 0.55
     private var templates: [MovementTemplate] = []
     private var onlineTemplates: [OnlineTemplateRecord] = []
     private var anchorThreshold: Double = 0.22
@@ -94,9 +139,9 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     func load(templates: [MovementTemplate]) {
-        self.templates = templates
+        self.templates = templates.map(Self.templateWithDepthCoverage)
         onlineTemplates.removeAll(keepingCapacity: true)
-        anchorThreshold = Self.learnThreshold(from: templates)
+        anchorThreshold = Self.learnThreshold(from: self.templates)
         resetCount()
     }
 
@@ -117,7 +162,8 @@ nonisolated final class FewShotRepetitionCounter {
             sourceFrameCount: frames.count,
             duration: duration,
             qualityScore: averageQuality,
-            vectors: weighted
+            vectors: weighted,
+            depthCoverage: Self.depthCoverage(in: weighted)
         )
     }
 
@@ -138,8 +184,6 @@ nonisolated final class FewShotRepetitionCounter {
         expirePendingCompletion(now: frame.timestamp)
 
         let candidate = bestCandidate()
-        bestScore = candidate?.score ?? .infinity
-        confidence = confidence(for: candidate)
 
         let cooldownElapsed = frame.timestamp - lastCountTimestamp > completionCooldown
         let immediateCandidate = immediateCompletionCandidate(
@@ -157,7 +201,14 @@ nonisolated final class FewShotRepetitionCounter {
             completedCandidate = completedPendingCandidate(with: frame)
         }
 
-        if let completedCandidate, cooldownElapsed {
+        let acceptedCompletedCandidate = completedCandidate.flatMap { candidate in
+            completionConfidencePasses(candidate) ? candidate : nil
+        }
+        if completedCandidate != nil, acceptedCompletedCandidate == nil {
+            pendingCompletion = nil
+        }
+
+        if let completedCandidate = acceptedCompletedCandidate, cooldownElapsed {
             repetitions += 1
             lastCountTimestamp = frame.timestamp
             promoteOnlineTemplate(from: completedCandidate)
@@ -165,7 +216,9 @@ nonisolated final class FewShotRepetitionCounter {
             buffer.removeAll(keepingCapacity: true)
         }
 
-        let displayedCandidate = completedCandidate ?? candidate
+        let displayedCandidate = acceptedCompletedCandidate ?? candidate
+        bestScore = displayedCandidate?.score ?? .infinity
+        confidence = confidence(for: displayedCandidate)
         return CountUpdate(
             repetitions: repetitions,
             confidence: confidence,
@@ -318,7 +371,9 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func rememberPendingCompletion(_ candidate: Candidate, now: TimeInterval) {
-        guard completionCandidateHasEnoughCoverage(candidate) else {
+        guard completionCandidateHasEnoughCoverage(candidate),
+              completionConfidencePasses(candidate)
+        else {
             return
         }
 
@@ -346,12 +401,17 @@ nonisolated final class FewShotRepetitionCounter {
               cooldownElapsed,
               candidate.score <= candidate.acceptanceThreshold,
               completionCandidateHasEnoughCoverage(candidate),
+              completionConfidencePasses(candidate),
               candidateCompletesImmediately(candidate, with: frame)
         else {
             return nil
         }
 
         return candidate
+    }
+
+    private func completionConfidencePasses(_ candidate: Candidate) -> Bool {
+        confidence(for: candidate) >= minimumCompletionConfidence
     }
 
     private func completedPendingCandidate(with frame: PoseFrame) -> Candidate? {
@@ -537,7 +597,8 @@ nonisolated final class FewShotRepetitionCounter {
             sourceFrameCount: candidate.segment.count,
             duration: max(duration, 0.1),
             qualityScore: candidate.averageQuality,
-            vectors: weighted
+            vectors: weighted,
+            depthCoverage: Self.depthCoverage(in: weighted)
         )
     }
 
@@ -574,6 +635,12 @@ nonisolated final class FewShotRepetitionCounter {
         scores.sort()
         let median = scores[scores.count / 2]
         return min(max(median + 0.08, 0.16), 0.34)
+    }
+
+    private static func templateWithDepthCoverage(_ template: MovementTemplate) -> MovementTemplate {
+        var template = template
+        template.depthCoverage = depthCoverage(in: template.vectors)
+        return template
     }
 
     private func resample(_ values: [PoseFeatureVector], targetCount: Int) -> [PoseFeatureVector] {
@@ -690,31 +757,16 @@ nonisolated final class FewShotRepetitionCounter {
         (.leftAnkle, .rightAnkle)
     ]
 
-    private static var rawPoseFeatureValueCount: Int {
-        jointOrder.count * 3
-    }
-
-    private static var angleFeatureValueCount: Int {
-        angleTriples.count
-    }
-
-    private static var depthDerivedFeatureValueCount: Int {
-        depthRelationPairs.count + depthDirectionPairs.count + depthAsymmetryPairs.count
-    }
-
-    private static var depthDerivedFeatureStartIndex: Int {
-        rawPoseFeatureValueCount + angleFeatureValueCount
-    }
-
-    private static var depthSensitiveFeatureIndices: [Int] {
+    private static let rawPoseFeatureValueCount = jointOrder.count * 3
+    private static let angleFeatureValueCount = angleTriples.count
+    private static let depthDerivedFeatureValueCount = depthRelationPairs.count + depthDirectionPairs.count + depthAsymmetryPairs.count
+    private static let depthDerivedFeatureStartIndex = rawPoseFeatureValueCount + angleFeatureValueCount
+    private static let poseFeatureValueCount = rawPoseFeatureValueCount + angleFeatureValueCount + depthDerivedFeatureValueCount
+    private static let depthSensitiveFeatureIndices: [Int] = {
         let rawDepthIndices = jointOrder.indices.map { ($0 * 3) + 2 }
         let derivedDepthIndices = (0..<depthDerivedFeatureValueCount).map { depthDerivedFeatureStartIndex + $0 }
         return rawDepthIndices + derivedDepthIndices
-    }
-
-    private static var poseFeatureValueCount: Int {
-        rawPoseFeatureValueCount + angleFeatureValueCount + depthDerivedFeatureValueCount
-    }
+    }()
 
     private static func featureVectors(from frames: [PoseFrame]) -> [PoseFeatureVector] {
         let poseVectors = frames.map { vector(from: $0) }
@@ -935,7 +987,7 @@ nonisolated final class FewShotRepetitionCounter {
         template: MovementTemplate,
         acceptanceThreshold: Double
     ) -> Bool {
-        let templateCoverage = depthCoverage(in: template.vectors)
+        let templateCoverage = template.depthCoverage
         guard templateCoverage >= 0.42 else {
             return true
         }

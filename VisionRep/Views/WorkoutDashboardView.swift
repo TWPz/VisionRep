@@ -105,17 +105,25 @@ struct WorkoutDashboardView: View {
     }
 
     private var centerReadout: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(model.repetitionCount)")
-                .font(.system(size: 112, weight: .bold, design: .rounded))
-                .monospacedDigit()
-            Text("reps")
-                .font(.title2.weight(.semibold))
+        VStack(spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(model.repetitionCount)")
+                    .font(.system(size: 112, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                Text("reps")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("Confidence \(model.matchConfidence, format: .percent.precision(.fractionLength(0)))")
+                .font(.footnote.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 24)
         .visionGlassPanel(cornerRadius: 28, tint: .black.opacity(0.08))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Live count \(model.repetitionCount) reps, confidence \(Int(model.matchConfidence * 100)) percent")
     }
 
     private var shouldShowCenterReadout: Bool {

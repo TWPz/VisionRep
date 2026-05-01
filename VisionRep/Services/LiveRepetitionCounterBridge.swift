@@ -18,17 +18,21 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     func load(templates: [MovementTemplate]) {
         discardPendingFrames()
+        resetLastReportedRepetitions()
         queue.async { [weak self] in
-            self?.lastReportedRepetitions = 0
-            self?.counter.load(templates: templates)
+            guard let self else { return }
+            self.counter.load(templates: templates)
+            self.resetLastReportedRepetitions()
         }
     }
 
     func resetCount() {
         discardPendingFrames()
+        resetLastReportedRepetitions()
         queue.async { [weak self] in
-            self?.lastReportedRepetitions = 0
-            self?.counter.resetCount()
+            guard let self else { return }
+            self.counter.resetCount()
+            self.resetLastReportedRepetitions()
         }
     }
 
@@ -61,15 +65,14 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     private func process(_ item: PendingFrame) {
         let update = counter.update(with: item.frame)
-        let countedNewRepetition = update.repetitions > lastReportedRepetitions
-        lastReportedRepetitions = update.repetitions
+        let countedNewRepetition = recordReportedRepetitions(update.repetitions)
 
         DispatchQueue.main.async { [weak self] in
             self?.onUpdate?(update, item.quality)
         }
 
         if countedNewRepetition {
-            discardPendingFrames()
+            discardPendingFrames(olderThan: item.frame.timestamp)
         }
         processNextPendingFrame()
     }
@@ -89,9 +92,27 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
         }
     }
 
-    private func discardPendingFrames() {
+    private func resetLastReportedRepetitions() {
         stateLock.lock()
-        pendingFrames.removeAll(keepingCapacity: true)
+        lastReportedRepetitions = 0
+        stateLock.unlock()
+    }
+
+    private func recordReportedRepetitions(_ repetitions: Int) -> Bool {
+        stateLock.lock()
+        let countedNewRepetition = repetitions > lastReportedRepetitions
+        lastReportedRepetitions = repetitions
+        stateLock.unlock()
+        return countedNewRepetition
+    }
+
+    private func discardPendingFrames(olderThan deadline: TimeInterval = .infinity) {
+        stateLock.lock()
+        if deadline == .infinity {
+            pendingFrames.removeAll(keepingCapacity: true)
+        } else {
+            pendingFrames.removeAll { $0.frame.timestamp <= deadline }
+        }
         stateLock.unlock()
     }
 }

@@ -18,6 +18,7 @@ nonisolated final class PoseFrameProcessor {
     private let poseSmoother = PoseSmoother()
     private var lastProcessedTimestamp: TimeInterval = 0
     private var lastThreeDimensionalFrame: PoseFrame?
+    private var lastThreeDimensionalAttemptTimestamp: TimeInterval = -.infinity
     private var lastThreeDimensionalTimestamp: TimeInterval = -.infinity
     private var bodyRegionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
     private let minimumFrameInterval: TimeInterval
@@ -31,6 +32,8 @@ nonisolated final class PoseFrameProcessor {
     private let minimumRegionWidth: CGFloat = 0.58
     private let minimumRegionHeight: CGFloat = 0.76
     private let regionSmoothingFactor: CGFloat = 0.72
+    private var consecutiveNoPoseFrameCount = 0
+    private let noPoseResetThreshold = 4
 
     init(targetFramesPerSecond: Double = 30) {
         minimumFrameInterval = 1 / targetFramesPerSecond
@@ -57,12 +60,16 @@ nonisolated final class PoseFrameProcessor {
         guard let observation else {
             poseSmoother.reset()
             lastThreeDimensionalFrame = nil
-            resetRegionOfInterest()
+            consecutiveNoPoseFrameCount += 1
+            if consecutiveNoPoseFrameCount >= noPoseResetThreshold {
+                resetRegionOfInterest()
+            }
             return .noPose(timestamp)
         }
 
         do {
             let twoDimensionalFrame = try makeFrame(from: observation, timestamp: timestamp)
+            consecutiveNoPoseFrameCount = 0
             updateRegionOfInterest(from: twoDimensionalFrame)
             refreshThreeDimensionalPoseIfNeeded(
                 on: sampleBuffer,
@@ -97,7 +104,7 @@ nonisolated final class PoseFrameProcessor {
     }
 
     private func shouldRefreshThreeDimensionalPose(at timestamp: TimeInterval) -> Bool {
-        timestamp - lastThreeDimensionalTimestamp >= minimum3DFrameInterval
+        timestamp - lastThreeDimensionalAttemptTimestamp >= minimum3DFrameInterval
     }
 
     private func refreshThreeDimensionalPoseIfNeeded(
@@ -109,7 +116,7 @@ nonisolated final class PoseFrameProcessor {
             return
         }
 
-        lastThreeDimensionalTimestamp = timestamp
+        lastThreeDimensionalAttemptTimestamp = timestamp
         guard let observation = try? performThreeDimensionalPoseRequest(on: sampleBuffer),
               let frame = makeThreeDimensionalFrame(
                 from: observation,
@@ -121,6 +128,7 @@ nonisolated final class PoseFrameProcessor {
         }
 
         lastThreeDimensionalFrame = frame
+        lastThreeDimensionalTimestamp = timestamp
     }
 
     private func updateRegionOfInterest(from frame: PoseFrame) {
@@ -217,10 +225,17 @@ nonisolated final class PoseFrameProcessor {
 
         var joints = twoDimensionalFrame.joints
         for (name, depthJoint) in depthFrame.joints {
-            guard let depth = depthJoint.z, var joint = joints[name] else {
+            guard let depth = depthJoint.z, let joint2D = joints[name] else {
                 continue
             }
 
+            let dx = joint2D.x - depthJoint.x
+            let dy = joint2D.y - depthJoint.y
+            guard (dx * dx + dy * dy) <= 0.06 else {
+                continue
+            }
+
+            var joint = joint2D
             joint.z = depth
             joint.confidence = max(joint.confidence, min(depthJoint.confidence, 1))
             joints[name] = joint

@@ -341,8 +341,11 @@ final class WorkoutSessionModel {
             return
         }
 
+        let previousRepetitionCount = repetitionCount
         repetitionCount = update.repetitions
-        matchConfidence = update.confidence
+        if update.repetitions > previousRepetitionCount {
+            matchConfidence = update.confidence
+        }
         latestMatcherScore = update.bestScore
         if update.confidence > 0.72 {
             updateStatus("Movement matched template \(update.matchedTemplateIndex ?? 0).")
