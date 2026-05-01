@@ -14,10 +14,21 @@ rg -q 'updateRegionOfInterest\(from: twoDimensionalFrame\)' "$processor_file"
 rg -q 'resetRegionOfInterest\(\)' "$processor_file"
 rg -q 'private let minimumRequiredRegionJointRatio = 0\.7' "$processor_file"
 rg -q 'private var consecutiveNoPoseFrameCount = 0' "$processor_file"
+rg -q 'private let smootherResetThreshold = 3' "$processor_file"
 rg -q 'private let noPoseResetThreshold = 4' "$processor_file"
+rg -q 'recordPoseDropout\(\)' "$processor_file"
 rg -q 'consecutiveNoPoseFrameCount \+= 1' "$processor_file"
+rg -q 'if consecutiveNoPoseFrameCount >= smootherResetThreshold' "$processor_file"
 rg -q 'if consecutiveNoPoseFrameCount >= noPoseResetThreshold' "$processor_file"
 rg -q 'consecutiveNoPoseFrameCount = 0' "$processor_file"
+if rg -U -q 'catch \{\n\s*poseSmoother\.reset\(\)' "$processor_file"; then
+    echo "PoseSmoother should not reset immediately on a transient pose request failure" >&2
+    exit 1
+fi
+if rg -U -q 'guard let observation else \{\n\s*poseSmoother\.reset\(\)' "$processor_file"; then
+    echo "PoseSmoother should not reset immediately on a single no-pose frame" >&2
+    exit 1
+fi
 rg -q 'PoseFrameFactory.requiredJoints.filter' "$processor_file"
 rg -q 'private func updateRegionOfInterest\(from frame: PoseFrame\)' "$processor_file"
 rg -q 'private func regionOfInterest\(for frame: PoseFrame\) -> CGRect\?' "$processor_file"

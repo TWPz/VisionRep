@@ -1,4 +1,5 @@
 import AVFoundation
+import Foundation
 import Speech
 
 @MainActor
@@ -15,7 +16,9 @@ final class VoiceCommandListener {
     private var recognitionTask: SFSpeechRecognitionTask?
     private var isTapInstalled = false
     private var didHandleCommand = false
-    private var voiceSessionID = 0
+    private let recognitionTimeoutSeconds: Int64 = 15
+    private var timeoutTask: Task<Void, Never>?
+    private var voiceSessionID = UUID()
 
     func start(
         listeningFor allowedCommands: Set<Command>,
@@ -23,7 +26,7 @@ final class VoiceCommandListener {
         onStatus: @escaping (String) -> Void
     ) {
         stop()
-        voiceSessionID += 1
+        voiceSessionID = UUID()
         let sessionID = voiceSessionID
         didHandleCommand = false
 
@@ -61,7 +64,10 @@ final class VoiceCommandListener {
     }
 
     func stop() {
-        voiceSessionID += 1
+        voiceSessionID = UUID()
+        timeoutTask?.cancel()
+        timeoutTask = nil
+
         recognitionTask?.cancel()
         recognitionTask = nil
 
@@ -81,7 +87,7 @@ final class VoiceCommandListener {
     }
 
     private func startRecognition(
-        sessionID: Int,
+        sessionID: UUID,
         listeningFor allowedCommands: Set<Command>,
         onCommand: @escaping (Command) -> Void,
         onStatus: @escaping (String) -> Void
@@ -131,6 +137,7 @@ final class VoiceCommandListener {
                 }
             }
 
+            scheduleRecognitionTimeout(sessionID: sessionID, onStatus: onStatus)
             onStatus(Self.statusText(for: allowedCommands))
         } catch {
             stop()
@@ -138,10 +145,26 @@ final class VoiceCommandListener {
         }
     }
 
+    private func scheduleRecognitionTimeout(
+        sessionID: UUID,
+        onStatus: @escaping (String) -> Void
+    ) {
+        timeoutTask?.cancel()
+        let timeoutSeconds = recognitionTimeoutSeconds
+        timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(timeoutSeconds))
+            guard let self, self.voiceSessionID == sessionID, !self.didHandleCommand else {
+                return
+            }
+            self.stop()
+            onStatus("Voice timed out - use button")
+        }
+    }
+
     private func handleRecognitionResult(
         _ result: SFSpeechRecognitionResult?,
         error: Error?,
-        sessionID: Int,
+        sessionID: UUID,
         listeningFor allowedCommands: Set<Command>,
         onCommand: @escaping (Command) -> Void,
         onStatus: @escaping (String) -> Void

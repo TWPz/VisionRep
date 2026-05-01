@@ -26,6 +26,11 @@ rg -q 'private static let poseFeatureValueCount = rawPoseFeatureValueCount \+ an
 rg -q 'private static let depthSensitiveFeatureIndices: \[Int\] = \{' "$counter_file"
 rg -q 'depthCoverage: Self\.depthCoverage\(in: weighted\)' "$counter_file"
 rg -q 'let templateCoverage = template\.depthCoverage' "$counter_file"
+rg -q 'private var depthMatchingEnabled = true' "$counter_file"
+rg -q 'depthMatchingEnabled = !Self\.shouldDisableDepthMatching\(for: loadedTemplates\)' "$counter_file"
+rg -q 'private static func shouldDisableDepthMatching\(for templates: \[MovementTemplate\]\) -> Bool' "$counter_file"
+rg -q 'private static func withoutDepthFeatures\(_ vectors: \[PoseFeatureVector\]\) -> \[PoseFeatureVector\]' "$counter_file"
+rg -q 'let comparableVectors = depthMatchingEnabled \? vectors : Self\.withoutDepthFeatures\(vectors\)' "$counter_file"
 if rg -q 'let segment = Array\(buffer\.suffix\(length\)\)' "$counter_file"; then
     echo "bestCandidate should avoid allocating frame arrays for every candidate length" >&2
     exit 1

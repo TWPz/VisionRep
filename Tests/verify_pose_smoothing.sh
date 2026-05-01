@@ -10,7 +10,17 @@ rg -q 'OneEuroFilter' "$smoother_file"
 rg -q 'PoseSmoother' "$smoother_file"
 rg -q 'lowConfidenceThreshold = 0\.5' "$smoother_file"
 rg -q 'maxRecentFrameCount = 3' "$smoother_file"
-rg -q 'recentFrames.suffix\(maxRecentFrameCount\)' "$smoother_file"
+rg -q 'recentFrames.removeFirst\(recentFrames.count - maxRecentFrameCount\)' "$smoother_file"
+rg -q 'let repairFrames = recentFrames.reversed\(\)' "$smoother_file"
+rg -q 'repairFrames: ReversedCollection<\[PoseFrame\]>' "$smoother_file"
+if rg -q 'recentFrames = Array\(recentFrames.suffix\(maxRecentFrameCount\)\)' "$smoother_file"; then
+    echo "PoseSmoother should trim recent frames in place without allocating" >&2
+    exit 1
+fi
+if rg -q 'recentFrames.suffix\(maxRecentFrameCount\).reversed\(\).enumerated\(\)' "$smoother_file"; then
+    echo "PoseSmoother should pre-reverse recent frames once per refine pass" >&2
+    exit 1
+fi
 rg -q 'poseSmoother.refine' "$processor_file"
 
 tmp_file="$(mktemp /tmp/visionrep-pose-smoothing-XXXXXX.swift)"

@@ -15,7 +15,7 @@ nonisolated final class ExerciseProfileStore: @unchecked Sendable {
         }
     }
 
-    func save(_ templates: [MovementTemplate]) {
+    func save(_ templates: [MovementTemplate]) -> Bool {
         do {
             let url = templatesURL()
             try FileManager.default.createDirectory(
@@ -26,8 +26,9 @@ nonisolated final class ExerciseProfileStore: @unchecked Sendable {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(templates)
             try data.write(to: url, options: [.atomic, .completeFileProtection])
+            return true
         } catch {
-            assertionFailure("Failed to save movement templates: \(error)")
+            return false
         }
     }
 

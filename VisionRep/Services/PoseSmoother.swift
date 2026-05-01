@@ -18,7 +18,9 @@ nonisolated final class PoseSmoother {
 
         let smoothedFrame = PoseFrame(timestamp: frame.timestamp, joints: smoothedJoints)
         recentFrames.append(smoothedFrame)
-        recentFrames = Array(recentFrames.suffix(maxRecentFrameCount))
+        if recentFrames.count > maxRecentFrameCount {
+            recentFrames.removeFirst(recentFrames.count - maxRecentFrameCount)
+        }
         return smoothedFrame
     }
 
@@ -31,10 +33,11 @@ nonisolated final class PoseSmoother {
         guard !recentFrames.isEmpty else { return frame }
 
         var joints = frame.joints
+        let repairFrames = recentFrames.reversed()
         for name in PoseJointName.allCases {
             let currentJoint = joints[name]
             guard currentJoint?.confidence ?? 0 < lowConfidenceThreshold,
-                  let repairedJoint = repairedJoint(name, currentJoint: currentJoint)
+                  let repairedJoint = repairedJoint(name, currentJoint: currentJoint, repairFrames: repairFrames)
             else {
                 continue
             }
@@ -45,7 +48,11 @@ nonisolated final class PoseSmoother {
         return PoseFrame(timestamp: frame.timestamp, joints: joints)
     }
 
-    private func repairedJoint(_ name: PoseJointName, currentJoint: PoseJoint?) -> PoseJoint? {
+    private func repairedJoint(
+        _ name: PoseJointName,
+        currentJoint: PoseJoint?,
+        repairFrames: ReversedCollection<[PoseFrame]>
+    ) -> PoseJoint? {
         var weightedX = 0.0
         var weightedY = 0.0
         var weightedZ = 0.0
@@ -65,7 +72,9 @@ nonisolated final class PoseSmoother {
             }
         }
 
-        for (offset, frame) in recentFrames.suffix(maxRecentFrameCount).reversed().enumerated() {
+        var offset = 0
+        for frame in repairFrames {
+            defer { offset += 1 }
             guard let previousJoint = frame.joint(name) else { continue }
 
             let decay = pow(0.9, Double(offset + 1))

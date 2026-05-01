@@ -176,7 +176,7 @@ final class WorkoutSessionModel {
         }
 
         templates.append(template)
-        profileStore.save(templates)
+        let didSaveTemplates = profileStore.save(templates)
         activeCaptureFrames.removeAll(keepingCapacity: true)
         activeCaptureQualityScores.removeAll(keepingCapacity: true)
         activeCaptureFrameCount = 0
@@ -185,7 +185,7 @@ final class WorkoutSessionModel {
         trainingCountdownRemaining = nil
 
         mode = templates.count >= 3 ? .templatesReady : .cameraReady
-        statusMessage = trainingProgressMessage
+        statusMessage = didSaveTemplates ? trainingProgressMessage : "Template save failed - check device storage."
         refreshVoiceCommandsForCurrentMode()
     }
 

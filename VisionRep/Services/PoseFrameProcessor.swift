@@ -33,6 +33,7 @@ nonisolated final class PoseFrameProcessor {
     private let minimumRegionHeight: CGFloat = 0.76
     private let regionSmoothingFactor: CGFloat = 0.72
     private var consecutiveNoPoseFrameCount = 0
+    private let smootherResetThreshold = 3
     private let noPoseResetThreshold = 4
 
     init(targetFramesPerSecond: Double = 30) {
@@ -51,19 +52,12 @@ nonisolated final class PoseFrameProcessor {
         do {
             observation = try performTwoDimensionalPoseRequest(on: sampleBuffer)
         } catch {
-            poseSmoother.reset()
-            lastThreeDimensionalFrame = nil
-            resetRegionOfInterest()
+            recordPoseDropout()
             return .failed(error.localizedDescription)
         }
 
         guard let observation else {
-            poseSmoother.reset()
-            lastThreeDimensionalFrame = nil
-            consecutiveNoPoseFrameCount += 1
-            if consecutiveNoPoseFrameCount >= noPoseResetThreshold {
-                resetRegionOfInterest()
-            }
+            recordPoseDropout()
             return .noPose(timestamp)
         }
 
@@ -79,7 +73,19 @@ nonisolated final class PoseFrameProcessor {
             let fusedFrame = mergeDepth(from: lastThreeDimensionalFrame, into: twoDimensionalFrame, timestamp: timestamp)
             return makePoseResult(from: fusedFrame)
         } catch {
+            recordPoseDropout()
             return .failed(error.localizedDescription)
+        }
+    }
+
+    private func recordPoseDropout() {
+        consecutiveNoPoseFrameCount += 1
+        if consecutiveNoPoseFrameCount >= smootherResetThreshold {
+            poseSmoother.reset()
+            lastThreeDimensionalFrame = nil
+        }
+        if consecutiveNoPoseFrameCount >= noPoseResetThreshold {
+            resetRegionOfInterest()
         }
     }
 
