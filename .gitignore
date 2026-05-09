@@ -31,17 +31,6 @@ playground.xcworkspace
 
 .build/
 
-# CocoaPods
-#
-# We recommend against adding the Pods directory to your .gitignore. However
-# you should judge for yourself, the pros and cons are mentioned at:
-# https://guides.cocoapods.org/using/using-cocoapods.html#should-i-check-the-pods-directory-into-source-control
-#
-# Pods/
-#
-# Add this line if you want to avoid checking in source code from the Xcode workspace
-# *.xcworkspace
-
 # Carthage
 #
 # Add this line if you want to avoid checking in source code from Carthage dependencies.
@@ -66,7 +55,10 @@ build/
 DerivedData/
 
 # Xcode User Settings (personal IDE config)
+# The MediaPipe CocoaPods integration requires the generated app workspace.
 *.xcworkspace
+!VisionRep.xcworkspace/
+!VisionRep.xcworkspace/contents.xcworkspacedata
 xcuserdata/
 *.xccheckout
 *.xcscmblueprint
@@ -75,7 +67,7 @@ xcuserdata/
 
 # CocoaPods (dependency manager)
 Pods/
-Podfile.lock
+!Podfile.lock
 
 # Swift Package Manager
 .swiftpm/
@@ -100,3 +92,5 @@ Config/Secret*.swift
 *.bak
 *.swp
 *~.nib
+.venv/
+Tools/openmmlab/
