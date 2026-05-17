@@ -55,7 +55,6 @@ build/
 DerivedData/
 
 # Xcode User Settings (personal IDE config)
-# The MediaPipe CocoaPods integration requires the generated app workspace.
 *.xcworkspace
 !VisionRep.xcworkspace/
 !VisionRep.xcworkspace/contents.xcworkspacedata
@@ -65,9 +64,8 @@ xcuserdata/
 *.xcscheme
 *.xcplugindata
 
-# CocoaPods (dependency manager)
+# Legacy dependency manager output
 Pods/
-!Podfile.lock
 
 # Swift Package Manager
 .swiftpm/

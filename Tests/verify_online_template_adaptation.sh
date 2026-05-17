@@ -113,6 +113,7 @@ for frame in makeStaticFrames(from: makeRep(start: 300).first!, start: 300) {
 }
 
 expect(latest.repetitions == 0, "static starting pose should not count")
+expect(latest.phaseProgress < 0.05, "static starting pose should not advance visible phase progress")
 expect(counter.onlineTemplateCount == 0, "static starting pose should not be promoted")
 
 print("online template adaptation behavior verified")

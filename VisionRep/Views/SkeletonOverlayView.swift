@@ -2,54 +2,131 @@ import SwiftUI
 
 struct SkeletonOverlayView: View {
     var pose: PoseFrame?
-    var sourceAspectRatio: CGFloat = 9.0 / 16.0
+    var sourceAspectRatio: CGFloat = 3.0 / 4.0
     var rotatesLandscapeSourceToPortrait = true
-    var mirrorsFrontCameraPreview = true
+    var mirrorsFrontCameraPreview = false
+    var renderFramesPerSecond: Double = 12
+
+    @State private var previousPose: PoseFrame?
+    @State private var targetPose: PoseFrame?
+    @State private var lastPoseChangeDate = Date()
+    @State private var timelineStartDate = Date()
 
     private let minimumJointConfidence = 0.12
 
     var body: some View {
-        Canvas { context, size in
-            guard let pose else { return }
-            let layout = AspectFillLayout(size: size, sourceAspectRatio: sourceAspectRatio)
+        TimelineView(.periodic(from: timelineStartDate, by: frameInterval)) { timeline in
+            Canvas { context, size in
+                guard let pose = interpolatedPose(at: timeline.date) else { return }
+                let layout = AspectFillLayout(size: size, sourceAspectRatio: sourceAspectRatio)
 
-            for connection in SkeletonConnection.all {
-                guard let start = pose.joint(connection.start),
-                      let end = pose.joint(connection.end),
-                      start.confidence >= minimumJointConfidence,
-                      end.confidence >= minimumJointConfidence
-                else {
-                    continue
+                for connection in SkeletonConnection.all {
+                    guard let start = pose.joint(connection.start),
+                          let end = pose.joint(connection.end),
+                          start.confidence >= minimumJointConfidence,
+                          end.confidence >= minimumJointConfidence
+                    else {
+                        continue
+                    }
+
+                    let startPoint = layout.point(for: start, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
+                    let endPoint = layout.point(for: end, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
+                    guard isDrawable(startPoint, in: size), isDrawable(endPoint, in: size) else {
+                        continue
+                    }
+
+                    var path = Path()
+                    path.move(to: startPoint)
+                    path.addLine(to: endPoint)
+                    context.stroke(
+                        path,
+                        with: .color(connection.group.color.opacity(0.82)),
+                        style: StrokeStyle(lineWidth: lineWidth(in: size), lineCap: .round, lineJoin: .round)
+                    )
                 }
 
-                let startPoint = layout.point(for: start, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
-                let endPoint = layout.point(for: end, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
-                guard isDrawable(startPoint, in: size), isDrawable(endPoint, in: size) else {
-                    continue
+                for (jointName, joint) in pose.joints where joint.confidence >= minimumJointConfidence {
+                    let point = layout.point(for: joint, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
+                    guard isDrawable(point, in: size) else { continue }
+
+                    let radius = jointRadius(in: size, confidence: joint.confidence)
+                    let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
+                    context.fill(Path(ellipseIn: rect), with: .color(SkeletonConnection.group(for: jointName).color.opacity(0.9)))
+                    context.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1)
                 }
-
-                var path = Path()
-                path.move(to: startPoint)
-                path.addLine(to: endPoint)
-                context.stroke(
-                    path,
-                    with: .color(connection.group.color.opacity(0.82)),
-                    style: StrokeStyle(lineWidth: lineWidth(in: size), lineCap: .round, lineJoin: .round)
-                )
             }
-
-            for (jointName, joint) in pose.joints where joint.confidence >= minimumJointConfidence {
-                let point = layout.point(for: joint, rotation: rotatesLandscapeSourceToPortrait, mirrored: mirrorsFrontCameraPreview)
-                guard isDrawable(point, in: size) else { continue }
-
-                let radius = jointRadius(in: size, confidence: joint.confidence)
-                let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
-                context.fill(Path(ellipseIn: rect), with: .color(SkeletonConnection.group(for: jointName).color.opacity(0.9)))
-                context.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1)
-            }
+        }
+        .onAppear {
+            previousPose = pose
+            targetPose = pose
+            lastPoseChangeDate = Date()
+        }
+        .onChange(of: pose) { _, newPose in
+            previousPose = targetPose
+            targetPose = newPose
+            lastPoseChangeDate = Date()
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+
+    private var frameInterval: TimeInterval {
+        1 / max(renderFramesPerSecond, 1)
+    }
+
+    private var interpolationDuration: TimeInterval {
+        min(max(frameInterval * 2, 0.08), 0.18)
+    }
+
+    private func interpolatedPose(at date: Date) -> PoseFrame? {
+        guard let targetPose else { return pose }
+        guard let previousPose else { return targetPose }
+
+        let elapsed = date.timeIntervalSince(lastPoseChangeDate)
+        guard elapsed < interpolationDuration else {
+            return targetPose
+        }
+
+        let blend = max(0, min(1, elapsed / interpolationDuration))
+        var joints: [PoseJointName: PoseJoint] = [:]
+        joints.reserveCapacity(max(previousPose.joints.count, targetPose.joints.count))
+
+        for (name, targetJoint) in targetPose.joints {
+            if let previousJoint = previousPose.joints[name] {
+                joints[name] = blendedJoint(previousJoint, targetJoint, blend: blend)
+            } else {
+                joints[name] = targetJoint
+            }
+        }
+
+        for (name, previousJoint) in previousPose.joints where joints[name] == nil {
+            joints[name] = previousJoint
+        }
+
+        let timestamp = previousPose.timestamp + ((targetPose.timestamp - previousPose.timestamp) * blend)
+        return PoseFrame(timestamp: timestamp, joints: joints)
+    }
+
+    private func blendedJoint(_ previous: PoseJoint, _ target: PoseJoint, blend: Double) -> PoseJoint {
+        PoseJoint(
+            x: previous.x + ((target.x - previous.x) * blend),
+            y: previous.y + ((target.y - previous.y) * blend),
+            confidence: previous.confidence + ((target.confidence - previous.confidence) * blend),
+            z: blendedDepth(previous.z, target.z, blend: blend)
+        )
+    }
+
+    private func blendedDepth(_ previous: Double?, _ target: Double?, blend: Double) -> Double? {
+        switch (previous, target) {
+        case let (previous?, target?):
+            previous + ((target - previous) * blend)
+        case let (nil, target?):
+            target
+        case let (previous?, nil):
+            previous
+        case (nil, nil):
+            nil
+        }
     }
 
     private struct AspectFillLayout {
@@ -88,7 +165,7 @@ struct SkeletonOverlayView: View {
             }
 
             let normalizedX = previewX
-            let normalizedY = 1 - previewY
+            let normalizedY = previewY
             if usesHeightConstraint {
                 return CGPoint(x: normalizedX * size.width, y: yOffset + normalizedY * drawnDimension)
             } else {

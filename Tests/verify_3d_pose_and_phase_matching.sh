@@ -3,12 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 pose_file="$repo_root/VisionRep/Models/PoseFrame.swift"
-processor_file="$repo_root/VisionRep/Services/PoseFrameProcessor.swift"
 counter_file="$repo_root/VisionRep/Repetition/FewShotRepetitionCounter.swift"
 
-rg -q 'VNDetectHumanBodyPose3DRequest' "$processor_file"
-rg -q 'makeThreeDimensionalFrame' "$processor_file"
-rg -q 'pointInImage' "$processor_file"
+rg -q 'z: Double\?' "$pose_file"
+rg -q 'z: nil' "$repo_root/VisionRep/Services/YoloCoreMLPoseEstimator.swift"
 rg -q 'z: Double\?' "$pose_file"
 rg -q 'phaseGatePasses' "$counter_file"
 rg -q 'featureVectors\(from:' "$counter_file"

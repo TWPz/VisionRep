@@ -9,23 +9,61 @@ nonisolated enum CameraState: Equatable, Sendable {
     case failed(String)
 }
 
-nonisolated enum CameraFramingMode: Equatable, Sendable {
-    case centerStageTracking
-    case widestView
+nonisolated enum CameraCaptureProfile: Equatable, Sendable {
+    case ready
+    case active
+    case adaptive(Double)
+
+    var targetFramesPerSecond: Double {
+        switch self {
+        case .ready:
+            12
+        case .active:
+            24
+        case .adaptive(let framesPerSecond):
+            min(max(framesPerSecond, 8), 24)
+        }
+    }
+
+    var targetDimensions: CMVideoDimensions {
+        CMVideoDimensions(width: 640, height: 480)
+    }
 }
 
 nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
 
     var frameHandler: ((CMSampleBuffer) -> Void)?
+    var onThermalStateChange: ((ProcessInfo.ThermalState) -> Void)?
+    var onActualFramesPerSecondChange: ((Double) -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "com.visionrep.camera.session")
     private let videoQueue = DispatchQueue(label: "com.visionrep.camera.frames", qos: .userInitiated)
     private let output = AVCaptureVideoDataOutput()
-    private let targetCameraFramesPerSecond: Double = 30
-    private let cameraPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-    private var framingMode: CameraFramingMode = .widestView
+    private let cameraPixelFormat = kCVPixelFormatType_32BGRA
+    private let preferredSessionPresets: [AVCaptureSession.Preset] = [.vga640x480, .iFrame960x540, .hd1280x720]
+    private var captureProfile: CameraCaptureProfile = .ready
+    private var thermalObserver: NSObjectProtocol?
     private var isConfigured = false
+    private var actualFrameRateWindowStartTimestamp: TimeInterval?
+    private var actualFrameRateWindowFrameCount = 0
+
+    override init() {
+        super.init()
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.onThermalStateChange?(ProcessInfo.processInfo.thermalState)
+        }
+    }
+
+    deinit {
+        if let thermalObserver {
+            NotificationCenter.default.removeObserver(thermalObserver)
+        }
+    }
 
     func requestAccessAndConfigure(completion: @escaping (CameraState) -> Void) {
         #if targetEnvironment(simulator)
@@ -68,45 +106,50 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         }
     }
 
-    func setFramingMode(_ mode: CameraFramingMode, completion: @escaping (CameraState) -> Void) {
-        DispatchQueue.main.async {
-            completion(.configuring)
-        }
-
+    func setCaptureProfile(_ profile: CameraCaptureProfile) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-
-            self.framingMode = mode
-            guard self.isConfigured else {
-                DispatchQueue.main.async {
-                    completion(.idle)
-                }
-                return
-            }
-
-            let wasRunning = self.session.isRunning
-            if wasRunning {
-                self.session.stopRunning()
-            }
+            self.captureProfile = profile
+            self.resetActualFrameRateWindow()
+            guard self.isConfigured,
+                  let device = (self.session.inputs.first as? AVCaptureDeviceInput)?.device
+            else { return }
 
             do {
-                try self.configureSession()
-                if wasRunning {
-                    self.session.startRunning()
-                }
-                DispatchQueue.main.async {
-                    completion(wasRunning ? .running : .idle)
-                }
+                try self.applyCaptureProfileToActiveDevice(device)
             } catch {
-                DispatchQueue.main.async {
-                    completion(.failed(error.localizedDescription))
-                }
+                self.onThermalStateChange?(ProcessInfo.processInfo.thermalState)
             }
         }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        recordActualCameraFrameRate(sampleBuffer)
         frameHandler?(sampleBuffer)
+    }
+
+    private func recordActualCameraFrameRate(_ sampleBuffer: CMSampleBuffer) {
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        guard let windowStartTimestamp = actualFrameRateWindowStartTimestamp else {
+            actualFrameRateWindowStartTimestamp = timestamp
+            actualFrameRateWindowFrameCount = 0
+            return
+        }
+
+        actualFrameRateWindowFrameCount += 1
+        let elapsed = timestamp - windowStartTimestamp
+        guard elapsed >= 1 else { return }
+
+        let framesPerSecond = Double(actualFrameRateWindowFrameCount) / elapsed
+        actualFrameRateWindowStartTimestamp = timestamp
+        actualFrameRateWindowFrameCount = 0
+        onActualFramesPerSecondChange?(framesPerSecond)
+    }
+
+    private func resetActualFrameRateWindow() {
+        actualFrameRateWindowStartTimestamp = nil
+        actualFrameRateWindowFrameCount = 0
+        onActualFramesPerSecondChange?(0)
     }
 
     private func configure(completion: @escaping (CameraState) -> Void) {
@@ -138,15 +181,16 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         session.inputs.forEach { session.removeInput($0) }
         session.outputs.forEach { session.removeOutput($0) }
 
-        if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
+        for preset in preferredSessionPresets where session.canSetSessionPreset(preset) {
+            session.sessionPreset = preset
+            break
         }
 
-        guard let device = preferredFrontCamera(for: framingMode) else {
+        guard let device = preferredFrontCamera() else {
             throw CameraConfigurationError.noCamera
         }
 
-        try configureDevice(device, for: framingMode)
+        try configureDevice(device)
 
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else {
@@ -175,115 +219,121 @@ nonisolated final class CameraFrameSource: NSObject, @unchecked Sendable, AVCapt
         }
     }
 
-    private func preferredFrontCamera(for mode: CameraFramingMode) -> AVCaptureDevice? {
+    private func preferredFrontCamera() -> AVCaptureDevice? {
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInUltraWideCamera, .builtInTrueDepthCamera, .builtInWideAngleCamera],
             mediaType: .video,
             position: .front
         )
 
-        let candidates: [AVCaptureDevice]
-        switch mode {
-        case .widestView:
-            let ultraWideDevices = discovery.devices.filter { $0.deviceType == .builtInUltraWideCamera }
-            candidates = ultraWideDevices.isEmpty ? discovery.devices : ultraWideDevices
-        case .centerStageTracking:
-            let centerStageDevices = discovery.devices.filter { device in
-                device.formats.contains(where: \.isCenterStageSupported)
-            }
-            candidates = centerStageDevices.isEmpty ? discovery.devices : centerStageDevices
+        let devicesSupportingRequestedFrameRate = discovery.devices.filter { device in
+            preferredWideFieldOfViewFormat(for: device) != nil
         }
+        let rankedDevices = devicesSupportingRequestedFrameRate.isEmpty
+            ? discovery.devices
+            : devicesSupportingRequestedFrameRate
 
-        return candidates.max { lhs, rhs in
-            widestSupportedFieldOfView(for: lhs, mode: mode) < widestSupportedFieldOfView(for: rhs, mode: mode)
+        return rankedDevices.max { lhs, rhs in
+            widestSupportedFieldOfView(for: lhs) < widestSupportedFieldOfView(for: rhs)
         }
     }
 
-    private func configureDevice(_ device: AVCaptureDevice, for mode: CameraFramingMode) throws {
-        configureCenterStage(for: mode, device: device)
-
+    private func configureDevice(_ device: AVCaptureDevice) throws {
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        if let wideFormat = preferredWideFieldOfViewFormat(for: device, mode: mode) {
+        if let wideFormat = preferredWideFieldOfViewFormat(for: device) {
             device.activeFormat = wideFormat
         }
 
-        let duration = CMTime(value: 1, timescale: CMTimeScale(targetCameraFramesPerSecond))
-        device.activeVideoMinFrameDuration = duration
-        device.activeVideoMaxFrameDuration = duration
-
+        try applyCaptureProfileToLockedDevice(device)
         device.videoZoomFactor = device.minAvailableVideoZoomFactor
     }
 
-    private func configureCenterStage(for mode: CameraFramingMode, device: AVCaptureDevice) {
-        switch mode {
-        case .widestView:
-            AVCaptureDevice.isCenterStageEnabled = false
-        case .centerStageTracking:
-            AVCaptureDevice.centerStageControlMode = .cooperative
-            guard device.formats.contains(where: \.isCenterStageSupported) else {
-                AVCaptureDevice.isCenterStageEnabled = false
-                return
-            }
-            AVCaptureDevice.isCenterStageEnabled = true
-        }
+    private func applyCaptureProfileToActiveDevice(_ device: AVCaptureDevice) throws {
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        try applyCaptureProfileToLockedDevice(device)
     }
 
-    private func preferredWideFieldOfViewFormat(for device: AVCaptureDevice, mode: CameraFramingMode) -> AVCaptureDevice.Format? {
-        let frameRateFormats = device.formats.filter { format in
-            format.supports(frameRate: targetCameraFramesPerSecond)
-        }
-        let candidates: [AVCaptureDevice.Format]
-        switch mode {
-        case .widestView:
-            candidates = frameRateFormats
-        case .centerStageTracking:
-            let centerStageFormats = frameRateFormats.filter(\.isCenterStageSupported)
-            candidates = centerStageFormats.isEmpty ? frameRateFormats : centerStageFormats
+    private func applyCaptureProfileToLockedDevice(_ device: AVCaptureDevice) throws {
+        if let preferredFormat = preferredWideFieldOfViewFormat(for: device),
+           device.activeFormat != preferredFormat {
+            device.activeFormat = preferredFormat
         }
 
-        return candidates.max { lhs, rhs in
+        guard let supportedFrameRate = supportedFrameRate(for: device, requestedFrameRate: captureProfile.targetFramesPerSecond) else {
+            throw CameraConfigurationError.noSupportedFrameRate
+        }
+
+        let duration = CMTime(value: 1, timescale: CMTimeScale(supportedFrameRate.rounded()))
+        device.activeVideoMinFrameDuration = duration
+        device.activeVideoMaxFrameDuration = duration
+    }
+
+    private func preferredWideFieldOfViewFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let frameRateFormats = device.formats.filter { format in
+            self.format(format, supportsFrameRate: captureProfile.targetFramesPerSecond)
+        }
+
+        return frameRateFormats.max { lhs, rhs in
             if lhs.videoFieldOfView == rhs.videoFieldOfView {
-                return formatDistanceFrom720p(lhs) > formatDistanceFrom720p(rhs)
+                return formatDistanceFromTargetResolution(lhs) > formatDistanceFromTargetResolution(rhs)
             }
             return lhs.videoFieldOfView < rhs.videoFieldOfView
         }
     }
 
-    private func widestSupportedFieldOfView(for device: AVCaptureDevice, mode: CameraFramingMode) -> Float {
-        preferredWideFieldOfViewFormat(for: device, mode: mode)?.videoFieldOfView
-            ?? device.formats.map(\.videoFieldOfView).max()
+    private func widestSupportedFieldOfView(for device: AVCaptureDevice) -> Float {
+        preferredWideFieldOfViewFormat(for: device)?.videoFieldOfView
             ?? 0
     }
 
-    private func formatDistanceFrom720p(_ format: AVCaptureDevice.Format) -> Int32 {
-        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-        return abs(dimensions.width - 1280) + abs(dimensions.height - 720)
-    }
-}
-
-private extension AVCaptureDevice.Format {
-    nonisolated func supports(frameRate: Double) -> Bool {
-        videoSupportedFrameRateRanges.contains { range in
-            range.minFrameRate <= frameRate && range.maxFrameRate >= frameRate
+    private func format(_ format: AVCaptureDevice.Format, supportsFrameRate requestedFrameRate: Double) -> Bool {
+        format.videoSupportedFrameRateRanges.contains { range in
+            range.minFrameRate <= requestedFrameRate && requestedFrameRate <= range.maxFrameRate
         }
     }
+
+    private func supportedFrameRate(for device: AVCaptureDevice, requestedFrameRate: Double) -> Double? {
+        let supportedFrameRates = device.activeFormat.videoSupportedFrameRateRanges
+            .filter { range in
+                range.minFrameRate <= requestedFrameRate && requestedFrameRate <= range.maxFrameRate
+            }
+        if !supportedFrameRates.isEmpty {
+            return requestedFrameRate
+        }
+
+        return device.activeFormat.videoSupportedFrameRateRanges
+            .map(\.maxFrameRate)
+            .filter { $0 <= requestedFrameRate }
+            .max()
+            ?? device.activeFormat.videoSupportedFrameRateRanges.map(\.minFrameRate).min()
+    }
+
+    private func formatDistanceFromTargetResolution(_ format: AVCaptureDevice.Format) -> Int32 {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        let targetDimensions = captureProfile.targetDimensions
+        return abs(dimensions.width - targetDimensions.width) + abs(dimensions.height - targetDimensions.height)
+    }
 }
 
-private nonisolated enum CameraConfigurationError: LocalizedError {
+private enum CameraConfigurationError: LocalizedError {
     case noCamera
     case cannotAddInput
     case cannotAddOutput
+    case noSupportedFrameRate
 
     var errorDescription: String? {
         switch self {
         case .noCamera:
             "No front camera is available on this device."
         case .cannotAddInput:
-            "The camera input could not be added."
+            "Unable to add the camera input."
         case .cannotAddOutput:
-            "The video frame output could not be added."
+            "Unable to add the camera output."
+        case .noSupportedFrameRate:
+            "The selected camera format does not support the requested frame rate."
         }
     }
 }

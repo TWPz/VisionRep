@@ -2,6 +2,7 @@ import Foundation
 
 nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
     var onUpdate: ((CountUpdate, PoseQuality) -> Void)?
+    var onActualFramesPerSecondChange: ((Double) -> Void)?
 
     private struct PendingFrame {
         var frame: PoseFrame
@@ -11,13 +12,18 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.visionrep.repetition.counter", qos: .userInitiated)
     private let stateLock = NSLock()
     private let counter = FewShotRepetitionCounter()
-    private let maxPendingFrameCount = 3
+    private let targetFramesPerSecond: Double = 12
     private var isProcessing = false
     private var lastReportedRepetitions = 0
-    private var pendingFrames: [PendingFrame] = []
+    private var lastAcceptedFrameTimestamp: TimeInterval = -.infinity
+    private var pendingFrame: PendingFrame?
+    private var actualFrameRateWindowStartTime: TimeInterval?
+    private var actualFrameRateWindowFrameCount = 0
 
     func load(templates: [MovementTemplate]) {
         discardPendingFrames()
+        resetThrottle()
+        resetActualFrameRateWindow()
         resetLastReportedRepetitions()
         queue.async { [weak self] in
             guard let self else { return }
@@ -28,6 +34,8 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     func resetCount() {
         discardPendingFrames()
+        resetThrottle()
+        resetActualFrameRateWindow()
         resetLastReportedRepetitions()
         queue.async { [weak self] in
             guard let self else { return }
@@ -44,14 +52,15 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
     }
 
     func submit(_ frame: PoseFrame, quality: PoseQuality) {
+        guard shouldAcceptFrame(timestamp: frame.timestamp) else {
+            return
+        }
+
         let item = PendingFrame(frame: frame, quality: quality)
 
         stateLock.lock()
         if isProcessing {
-            pendingFrames.append(item)
-            while pendingFrames.count > maxPendingFrameCount {
-                pendingFrames.removeFirst()
-            }
+            pendingFrame = item
             stateLock.unlock()
             return
         }
@@ -65,6 +74,7 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     private func process(_ item: PendingFrame) {
         let update = counter.update(with: item.frame)
+        recordActualFrameRate()
         let countedNewRepetition = recordReportedRepetitions(update.repetitions)
 
         DispatchQueue.main.async { [weak self] in
@@ -79,17 +89,75 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
 
     private func processNextPendingFrame() {
         stateLock.lock()
-        guard !pendingFrames.isEmpty else {
+        guard let item = pendingFrame else {
             isProcessing = false
             stateLock.unlock()
             return
         }
-        let item = pendingFrames.removeFirst()
+        pendingFrame = nil
         stateLock.unlock()
 
         queue.async { [weak self] in
             self?.process(item)
         }
+    }
+
+    private func shouldAcceptFrame(timestamp: TimeInterval) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard timestamp - lastAcceptedFrameTimestamp >= minimumFrameInterval else {
+            return false
+        }
+        lastAcceptedFrameTimestamp = timestamp
+        return true
+    }
+
+    private func resetThrottle() {
+        stateLock.lock()
+        lastAcceptedFrameTimestamp = -.infinity
+        stateLock.unlock()
+    }
+
+    private func resetActualFrameRateWindow() {
+        stateLock.lock()
+        actualFrameRateWindowStartTime = nil
+        actualFrameRateWindowFrameCount = 0
+        stateLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.onActualFramesPerSecondChange?(0)
+        }
+    }
+
+    private func recordActualFrameRate() {
+        let now = Date().timeIntervalSince1970
+
+        stateLock.lock()
+        guard let windowStartTime = actualFrameRateWindowStartTime else {
+            actualFrameRateWindowStartTime = now
+            actualFrameRateWindowFrameCount = 0
+            stateLock.unlock()
+            return
+        }
+
+        actualFrameRateWindowFrameCount += 1
+        let elapsed = now - windowStartTime
+        guard elapsed >= 1 else {
+            stateLock.unlock()
+            return
+        }
+
+        let framesPerSecond = Double(actualFrameRateWindowFrameCount) / elapsed
+        actualFrameRateWindowStartTime = now
+        actualFrameRateWindowFrameCount = 0
+        stateLock.unlock()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onActualFramesPerSecondChange?(framesPerSecond)
+        }
+    }
+
+    private var minimumFrameInterval: TimeInterval {
+        1 / targetFramesPerSecond
     }
 
     private func resetLastReportedRepetitions() {
@@ -109,9 +177,9 @@ nonisolated final class LiveRepetitionCounterBridge: @unchecked Sendable {
     private func discardPendingFrames(olderThan deadline: TimeInterval = .infinity) {
         stateLock.lock()
         if deadline == .infinity {
-            pendingFrames.removeAll(keepingCapacity: true)
-        } else {
-            pendingFrames.removeAll { $0.frame.timestamp <= deadline }
+            pendingFrame = nil
+        } else if let existing = pendingFrame, existing.frame.timestamp <= deadline {
+            pendingFrame = nil
         }
         stateLock.unlock()
     }

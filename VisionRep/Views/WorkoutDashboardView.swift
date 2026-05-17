@@ -1,4 +1,6 @@
+import AudioToolbox
 import SwiftUI
+import UIKit
 
 struct WorkoutDashboardView: View {
     @Bindable var model: WorkoutSessionModel
@@ -7,8 +9,7 @@ struct WorkoutDashboardView: View {
         ZStack {
             cameraLayer
 
-            SkeletonOverlayView(pose: model.latestPose)
-                .ignoresSafeArea()
+            SkeletonOverlayLayer(model: model)
 
             VStack(spacing: 0) {
                 topBar
@@ -34,6 +35,7 @@ struct WorkoutDashboardView: View {
         .background(Color.black)
         .preferredColorScheme(.dark)
         .task {
+            LiveCountButtonFeedback.prepare()
             if case .setup = model.mode {
                 model.startCamera()
             }
@@ -68,25 +70,28 @@ struct WorkoutDashboardView: View {
 
     private var topBarContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("VisionRep (Codex)")
+                    Text("MPiPE")
                         .font(.title3.weight(.semibold))
                     Text(model.statusMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.82)
+                        .minimumScaleFactor(0.72)
                 }
 
-                Spacer(minLength: 12)
+                Spacer(minLength: 8)
 
                 HStack(spacing: 8) {
                     QualityBadge(quality: model.poseQuality)
-
-                    CameraFramingToggleButton(mode: model.cameraFramingMode) {
-                        model.toggleCameraFramingMode()
-                    }
+                    HeatWatchBadge(status: model.heatStatus)
+                    FPSDebugBadge(
+                        cameraFramesPerSecond: model.debugCameraFramesPerSecond,
+                        poseFramesPerSecond: model.debugPoseFramesPerSecond,
+                        uiFramesPerSecond: model.debugUIDeliveryFramesPerSecond,
+                        repetitionFramesPerSecond: model.debugRepetitionFramesPerSecond
+                    )
                 }
             }
 
@@ -105,25 +110,28 @@ struct WorkoutDashboardView: View {
     }
 
     private var centerReadout: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(model.repetitionCount)")
+                Text("\(model.displayedRepetitionCount)")
                     .font(.system(size: 112, weight: .bold, design: .rounded))
                     .monospacedDigit()
+                    .opacity(model.isRepetitionConfirmationPending ? 0.72 : 1)
                 Text("reps")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
 
-            Text("Confidence \(model.matchConfidence, format: .percent.precision(.fractionLength(0)))")
-                .font(.footnote.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.secondary)
+            PhasePathProgressBar(
+                phasePathProgress: model.movementPhaseProgress,
+                matchConfidence: model.matchConfidence,
+                isPendingCompletion: model.isRepetitionConfirmationPending
+            )
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 24)
         .visionGlassPanel(cornerRadius: 28, tint: .black.opacity(0.08))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Live count \(model.repetitionCount) reps, confidence \(Int(model.matchConfidence * 100)) percent")
+        .accessibilityLabel("Live count \(model.displayedRepetitionCount) reps, confidence \(Int(model.matchConfidence * 100)) percent, phase \(Int(model.movementPhaseProgress * 100)) percent")
     }
 
     private var shouldShowCenterReadout: Bool {
@@ -173,7 +181,7 @@ struct WorkoutDashboardView: View {
                     systemImage: primaryActionIcon,
                     isProminent: true
                 ) {
-                    model.performPrimaryAction()
+                    performPrimaryAction()
                 }
                 .disabled(!primaryActionEnabled)
 
@@ -198,6 +206,13 @@ struct WorkoutDashboardView: View {
         }
         .padding(14)
         .visionGlassPanel(cornerRadius: 28, tint: .white.opacity(0.08), interactive: true)
+    }
+
+    private func performPrimaryAction() {
+        if model.primaryActionTitle == "Count Live" {
+            LiveCountButtonFeedback.play()
+        }
+        model.performPrimaryAction()
     }
 
     private var primaryActionIcon: String {
@@ -250,6 +265,7 @@ private struct SlimTrainingStatus: View {
                 .font(.caption.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .minimumScaleFactor(0.72)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
@@ -291,7 +307,27 @@ private struct LiveCountButton: View {
     var action: () -> Void
 
     var body: some View {
-        GlassActionButton(title: "Count Live", systemImage: "play.fill", action: action)
+        GlassActionButton(title: "Count Live", systemImage: "play.fill", action: performAction)
+    }
+
+    private func performAction() {
+        LiveCountButtonFeedback.play()
+        action()
+    }
+}
+
+private enum LiveCountButtonFeedback {
+    private static let impactGenerator = UIImpactFeedbackGenerator(style: .medium)
+    private static let startSoundID: SystemSoundID = 1104
+
+    static func prepare() {
+        impactGenerator.prepare()
+    }
+
+    static func play() {
+        impactGenerator.impactOccurred(intensity: 0.85)
+        AudioServicesPlaySystemSound(LiveCountButtonFeedback.startSoundID)
+        impactGenerator.prepare()
     }
 }
 
@@ -316,26 +352,65 @@ private struct CenterTrainingCountdownView: View {
     }
 }
 
-private struct CameraFramingToggleButton: View {
-    var mode: CameraFramingMode
-    var action: () -> Void
+private struct PhasePathProgressBar: View {
+    var phasePathProgress: Double
+    var matchConfidence: Double
+    var isPendingCompletion: Bool
+
+    private var clampedProgress: Double {
+        min(max(phasePathProgress, 0), 1)
+    }
+
+    private var clampedConfidence: Double {
+        min(max(matchConfidence, 0), 1)
+    }
 
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: 3) {
-                Image(systemName: mode.systemImage)
-                    .font(.subheadline.weight(.bold))
-                Text(mode.shortTitle)
-                    .font(.caption2.weight(.bold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+        VStack(spacing: 7) {
+            GeometryReader { proxy in
+                let width = proxy.size.width
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(.white.opacity(0.16))
+
+                    Capsule()
+                        .fill(progressTint)
+                        .frame(width: max(8, width * clampedProgress))
+
+                    HStack(spacing: 0) {
+                        ForEach(1..<4, id: \.self) { index in
+                            Spacer()
+                            Rectangle()
+                                .fill(.black.opacity(0.28))
+                                .frame(width: 1, height: 18)
+                            Spacer()
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                }
             }
-            .frame(width: 54, height: 48)
-            .visionGlassPanel(cornerRadius: 16, tint: .white.opacity(0.1), interactive: true)
+            .frame(width: 184, height: 18)
+            .animation(.snappy(duration: 0.18), value: clampedProgress)
+
+            HStack(spacing: 12) {
+                Text("Rep path \(clampedProgress, format: .percent.precision(.fractionLength(0)))")
+                Text("Match \(clampedConfidence, format: .percent.precision(.fractionLength(0)))")
+            }
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(mode.accessibilityLabel)
-        .accessibilityHint("Switch camera framing")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Rep path \(Int(clampedProgress * 100)) percent, match \(Int(clampedConfidence * 100)) percent")
+    }
+
+    private var progressTint: Color {
+        if isPendingCompletion || clampedProgress >= 0.9 {
+            return .mint
+        }
+        if clampedProgress >= 0.5 {
+            return .cyan
+        }
+        return .white.opacity(0.72)
     }
 }
 
@@ -343,15 +418,16 @@ private struct QualityBadge: View {
     var quality: PoseQuality
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 3) {
+        VStack(spacing: 4) {
             Text(quality.label)
                 .font(.subheadline.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
             Text(quality.score.formatted(.percent.precision(.fractionLength(0))))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 9)
-        .padding(.horizontal, 12)
+        .frame(width: 66, height: 62)
         .visionGlassPanel(cornerRadius: 18, tint: badgeColor.opacity(0.2))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Pose quality \(quality.label), \(Int(quality.score * 100)) percent")
@@ -369,54 +445,87 @@ private struct QualityBadge: View {
     }
 }
 
-private extension CameraFramingMode {
-    var shortTitle: String {
-        switch self {
-        case .centerStageTracking:
-            "Track"
-        case .widestView:
-            "Wide"
+private struct HeatWatchBadge: View {
+    var status: HeatStatus
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text("Heat")
+                .font(.subheadline.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(status.stateLabel)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
         }
+        .frame(width: 66, height: 62)
+        .visionGlassPanel(cornerRadius: 18, tint: tint.opacity(0.22))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Thermal state \(status.stateLabel)")
     }
 
-    var systemImage: String {
-        switch self {
-        case .centerStageTracking:
-            "dot.viewfinder"
-        case .widestView:
-            "arrow.up.left.and.arrow.down.right"
-        }
-    }
-
-    var accessibilityLabel: String {
-        switch self {
-        case .centerStageTracking:
-            "Center Stage tracking on"
-        case .widestView:
-            "Widest camera view on"
+    private var tint: Color {
+        switch status.thermalState {
+        case .nominal:
+            .green
+        case .fair:
+            .yellow
+        case .serious:
+            .orange
+        case .critical:
+            .red
+        @unknown default:
+            .gray
         }
     }
 }
 
-private struct MetricChip: View {
-    var title: String
-    var value: String
-    var systemImage: String
+private struct FPSDebugBadge: View {
+    var cameraFramesPerSecond: Double
+    var poseFramesPerSecond: Double
+    var uiFramesPerSecond: Double
+    var repetitionFramesPerSecond: Double
 
     var body: some View {
-        VStack(spacing: 5) {
-            Image(systemName: systemImage)
-                .font(.subheadline.weight(.semibold))
-            Text(value)
-                .font(.headline.monospacedDigit())
-            Text(title)
-                .font(.caption2)
+        let cameraFPS = Int(cameraFramesPerSecond.rounded())
+        let poseFPS = Int(poseFramesPerSecond.rounded())
+        let uiFPS = Int(uiFramesPerSecond.rounded())
+        let repetitionFPS = Int(repetitionFramesPerSecond.rounded())
+        let cameraText = cameraFPS > 0 ? "\(cameraFPS)" : "--"
+        let poseText = poseFPS > 0 ? "\(poseFPS)" : "--"
+        let uiText = uiFPS > 0 ? "\(uiFPS)" : "--"
+        let repetitionText = repetitionFPS > 0 ? "\(repetitionFPS)" : "--"
+
+        VStack(spacing: 4) {
+            Text("FPS")
+                .font(.subheadline.weight(.bold))
+            Text("C\(cameraText) P\(poseText)")
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text("U\(uiText) R\(repetitionText)")
+                .font(.caption2.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .visionGlassPanel(cornerRadius: 18, tint: .white.opacity(0.05))
+        .frame(width: 104, height: 62)
+        .visionGlassPanel(cornerRadius: 18, tint: Color.cyan.opacity(0.22))
         .accessibilityElement(children: .combine)
+        .accessibilityLabel("Actual camera \(cameraText) frames per second, pose \(poseText) frames per second, UI \(uiText) frames per second, repetition counter \(repetitionText) frames per second")
+    }
+}
+
+private struct SkeletonOverlayLayer: View {
+    @Bindable var model: WorkoutSessionModel
+    private static let skeletonOverlayFramesPerSecond: Double = 12
+
+    var body: some View {
+        SkeletonOverlayView(
+            pose: model.latestPose,
+            sourceAspectRatio: 3.0 / 4.0,
+            renderFramesPerSecond: Self.skeletonOverlayFramesPerSecond
+        )
+        .ignoresSafeArea()
     }
 }
 
@@ -519,15 +628,9 @@ private struct PermissionPlaceholderView: View {
                     .font(.system(size: 56, weight: .semibold))
                     .foregroundStyle(.white)
                 Text(title)
-                    .font(.title2.weight(.semibold))
-                Text("All pose estimation runs on this device. Video frames are used only for live tracking.")
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 28)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.white)
             }
-            .padding(24)
-            .visionGlassPanel(cornerRadius: 28)
         }
     }
 }

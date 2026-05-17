@@ -6,13 +6,20 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A1B2C3D4E5F60718293A4B5C /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* AppIntents.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
-		616D3ACD2FA21714008D8A60 /* VisionRep.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VisionRep.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		616D3ACD2FA21714008D8A60 /* MPiPE.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MPiPE.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1B2C3D4E5F60718293A4B5D /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		616D3ACF2FA21714008D8A60 /* VisionRep */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = VisionRep;
 			sourceTree = "<group>";
 		};
@@ -23,6 +30,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1B2C3D4E5F60718293A4B5C /* AppIntents.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -34,15 +42,24 @@
 			children = (
 				616D3ACF2FA21714008D8A60 /* VisionRep */,
 				616D3ACE2FA21714008D8A60 /* Products */,
+				FD657D7DCB5C0A1EAE9DD864 /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
 		616D3ACE2FA21714008D8A60 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				616D3ACD2FA21714008D8A60 /* VisionRep.app */,
+				616D3ACD2FA21714008D8A60 /* MPiPE.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		FD657D7DCB5C0A1EAE9DD864 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4E5F60718293A4B5D /* AppIntents.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -64,10 +81,8 @@
 				616D3ACF2FA21714008D8A60 /* VisionRep */,
 			);
 			name = VisionRep;
-			packageProductDependencies = (
-			);
 			productName = VisionRep;
-			productReference = 616D3ACD2FA21714008D8A60 /* VisionRep.app */;
+			productReference = 616D3ACD2FA21714008D8A60 /* MPiPE.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -256,6 +271,7 @@
 				DEVELOPMENT_TEAM = Q5WFS62UPZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MPiPE;
 				INFOPLIST_KEY_NSCameraUsageDescription = "VisionRep uses the camera to estimate body pose on device and count exercise repetitions in real time.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VisionRep listens for the word stop during training so you can finish a recorded rep hands-free.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VisionRep recognizes the word stop on device during training sessions.";
@@ -269,8 +285,8 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = pz.VisionRep;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.twpz.mpipe;
+				PRODUCT_NAME = MPiPE;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
@@ -291,6 +307,7 @@
 				DEVELOPMENT_TEAM = Q5WFS62UPZ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MPiPE;
 				INFOPLIST_KEY_NSCameraUsageDescription = "VisionRep uses the camera to estimate body pose on device and count exercise repetitions in real time.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VisionRep listens for the word stop during training so you can finish a recorded rep hands-free.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VisionRep recognizes the word stop on device during training sessions.";
@@ -304,8 +321,8 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = pz.VisionRep;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.twpz.mpipe;
+				PRODUCT_NAME = MPiPE;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;

@@ -2,7 +2,8 @@ import Foundation
 
 nonisolated final class PoseSmoother {
     private let lowConfidenceThreshold = 0.5
-    private let maxRecentFrameCount = 3
+    private let maxRecentFrameCount = 2
+    private static let repairDecayWeights = [0.9, 0.81]
     private var filters: [PoseJointName: JointFilter] = [:]
     private var recentFrames: [PoseFrame] = []
 
@@ -77,7 +78,7 @@ nonisolated final class PoseSmoother {
             defer { offset += 1 }
             guard let previousJoint = frame.joint(name) else { continue }
 
-            let decay = pow(0.9, Double(offset + 1))
+            let decay = Self.repairDecayWeights[offset]
             let weight = previousJoint.confidence * decay
             guard weight > bestConfidence else { continue }
 

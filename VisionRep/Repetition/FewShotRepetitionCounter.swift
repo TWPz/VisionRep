@@ -9,6 +9,7 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
     var qualityScore: Double
     var vectors: [PoseFeatureVector]
     var depthCoverage: Double
+    var phaseProfile: MovementPhaseProfile
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -19,6 +20,7 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
         case qualityScore
         case vectors
         case depthCoverage
+        case phaseProfile
     }
 
     init(
@@ -29,7 +31,8 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
         duration: TimeInterval,
         qualityScore: Double,
         vectors: [PoseFeatureVector],
-        depthCoverage: Double = 0
+        depthCoverage: Double = 0,
+        phaseProfile: MovementPhaseProfile = MovementPhaseProfile()
     ) {
         self.id = id
         self.index = index
@@ -39,6 +42,7 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
         self.qualityScore = qualityScore
         self.vectors = vectors
         self.depthCoverage = depthCoverage
+        self.phaseProfile = phaseProfile
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +55,34 @@ nonisolated struct MovementTemplate: Identifiable, Codable, Equatable, Sendable 
         qualityScore = try container.decode(Double.self, forKey: .qualityScore)
         vectors = try container.decode([PoseFeatureVector].self, forKey: .vectors)
         depthCoverage = try container.decodeIfPresent(Double.self, forKey: .depthCoverage) ?? 0
+        phaseProfile = try container.decodeIfPresent(MovementPhaseProfile.self, forKey: .phaseProfile) ?? MovementPhaseProfile()
+    }
+}
+
+nonisolated enum MovementComplexity: String, Codable, Equatable, Sendable {
+    case simple
+    case medium
+    case complex
+}
+
+nonisolated struct MovementPhaseProfile: Codable, Equatable, Sendable {
+    var checkpointIndices: [Int]
+    var complexity: MovementComplexity
+
+    private enum CodingKeys: String, CodingKey {
+        case checkpointIndices
+        case complexity
+    }
+
+    init(checkpointIndices: [Int] = [], complexity: MovementComplexity = .complex) {
+        self.checkpointIndices = checkpointIndices
+        self.complexity = complexity
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        checkpointIndices = try container.decodeIfPresent([Int].self, forKey: .checkpointIndices) ?? []
+        complexity = try container.decodeIfPresent(MovementComplexity.self, forKey: .complexity) ?? .complex
     }
 }
 
@@ -61,24 +93,38 @@ nonisolated struct CountUpdate: Equatable, Sendable {
     var matchedTemplateIndex: Int?
     var matchedTemplateSource: TemplateMatchSource?
     var onlineTemplateCount = 0
+    var phaseProgress = 0.0
+    var pendingRepetition = false
+    var didCalibrateView = false
 }
 
 nonisolated enum TemplateMatchSource: String, Equatable, Sendable {
     case anchor
     case online
+    case calibration
 }
 
 nonisolated final class FewShotRepetitionCounter {
     private let sampleCount = 48
     private let maxOnlineTemplateCount = 4
-    private let onlinePromotionConfidenceThreshold = 0.85
+    private let onlinePromotionConfidenceThreshold = 0.5
     private let minimumCompletionConfidence = 0.55
+    private let conservativeCountGateRepetitionLimit = 10
+    private let conservativeCompletionCoverageRatio = 0.6
+    private let relaxedCompletionCoverageRatio = 0.38
+    private let complexCompletionCoverageRatio = 0.2
+    private static let anchorPassThroughScore = 0.0
     private var templates: [MovementTemplate] = []
     private var onlineTemplates: [OnlineTemplateRecord] = []
+    private var calibrationTemplates: [MovementTemplate] = []
     private var anchorThreshold: Double = 0.22
     private var depthMatchingEnabled = true
-    private var buffer: [PoseFrame] = []
+    private var buffer: [BufferedPoseFrame] = []
     private var pendingCompletion: PendingCompletion?
+    private var streamingPhaseCounter = StreamingPhaseCounter()
+    private var phaseTracker = PhaseProgressTracker()
+    private var lastCompletionPoseVector: PoseFeatureVector?
+    private var hasExitedCompletionPoseSinceLastCount = true
     private var lastCountTimestamp: TimeInterval = -.infinity
     private(set) var repetitions = 0
     private(set) var confidence = 0.0
@@ -100,6 +146,28 @@ nonisolated final class FewShotRepetitionCounter {
         var source: TemplateMatchSource
     }
 
+    private struct BufferedPoseFrame {
+        var frame: PoseFrame
+        var poseVector: PoseFeatureVector
+
+        var timestamp: TimeInterval {
+            frame.timestamp
+        }
+    }
+
+    private struct PhaseProgressTracker {
+        struct Signal {
+            var progress: Double
+        }
+
+        mutating func update(frameCount: Int, expectedFrameCount: Int) -> Signal {
+            let expected = max(expectedFrameCount, 1)
+            return Signal(progress: min(max(Double(frameCount) / Double(expected), 0), 1))
+        }
+
+        mutating func reset() {}
+    }
+
     private struct Candidate {
         var score: Double
         var templateIndex: Int
@@ -117,6 +185,252 @@ nonisolated final class FewShotRepetitionCounter {
         var expiresAt: TimeInterval
     }
 
+    private struct StreamingPhaseCompletion {
+        var record: TemplateRecord
+        var startedAt: TimeInterval
+        var completedAt: TimeInterval
+        var averageCheckpointScore: Double
+    }
+
+    private struct StreamingPhaseResult {
+        var progress: Double
+        var confidence: Double
+        var bestScore: Double
+        var matchedTemplateIndex: Int?
+        var matchedTemplateSource: TemplateMatchSource?
+        var completion: StreamingPhaseCompletion?
+    }
+
+    private struct StreamingPhaseCounter {
+        private struct Track {
+            var nextCheckpointCursor = 0
+            var startedAt: TimeInterval?
+            var lastAdvancedAt: TimeInterval?
+            var completedAt: TimeInterval?
+            var lastAcceptedVector: PoseFeatureVector?
+            var scoreSum = 0.0
+        }
+
+        private var tracks: [UUID: Track] = [:]
+
+        mutating func reset() {
+            tracks.removeAll(keepingCapacity: true)
+        }
+
+        mutating func update(
+            with poseVector: PoseFeatureVector,
+            at timestamp: TimeInterval,
+            records: [TemplateRecord],
+            anchorThreshold: Double,
+            completionGateOpen: Bool
+        ) -> StreamingPhaseResult {
+            let liveIDs = Set(records.map(\.template.id))
+            tracks = tracks.filter { liveIDs.contains($0.key) }
+
+            var bestProgress = 0.0
+            var bestConfidence = 0.0
+            var bestScore = Double.infinity
+            var matchedTemplateIndex: Int?
+            var matchedTemplateSource: TemplateMatchSource?
+            var completion: StreamingPhaseCompletion?
+
+            for record in records {
+                let template = record.template
+                let checkpoints = Self.checkpoints(for: template)
+                guard checkpoints.count >= 2 else {
+                    continue
+                }
+
+                var track = tracks[template.id] ?? Track()
+                if let lastAdvancedAt = track.lastAdvancedAt,
+                   timestamp - lastAdvancedAt > Self.timeout(for: template) {
+                    track = Track()
+                }
+
+                let expectedCursor = min(track.nextCheckpointCursor, checkpoints.count - 1)
+                let checkpointIndex = checkpoints[expectedCursor]
+                let checkpointVector = template.vectors[checkpointIndex]
+                let distance = poseVector.distance(
+                    to: checkpointVector,
+                    limitedTo: FewShotRepetitionCounter.poseFeatureValueCount
+                )
+                let threshold = Self.threshold(
+                    forCursor: expectedCursor,
+                    checkpointCount: checkpoints.count,
+                    template: template,
+                    anchorThreshold: anchorThreshold
+                )
+
+                if distance <= threshold,
+                   Self.didMoveEnoughSinceLastCheckpoint(
+                       poseVector,
+                       track: track,
+                       expectedCursor: expectedCursor,
+                       checkpoints: checkpoints,
+                       template: template,
+                       anchorThreshold: anchorThreshold
+                   ) {
+                    if track.nextCheckpointCursor == 0 {
+                        track.startedAt = timestamp
+                        track.scoreSum = 0
+                    }
+                    track.scoreSum += distance
+                    track.nextCheckpointCursor = min(track.nextCheckpointCursor + 1, checkpoints.count)
+                    track.lastAdvancedAt = timestamp
+                    track.lastAcceptedVector = poseVector
+
+                    if track.nextCheckpointCursor >= checkpoints.count,
+                       completionGateOpen,
+                       let startedAt = track.startedAt {
+                        track.completedAt = timestamp
+                        let averageScore = track.scoreSum / Double(checkpoints.count)
+                        let candidateCompletion = StreamingPhaseCompletion(
+                            record: record,
+                            startedAt: startedAt,
+                            completedAt: timestamp,
+                            averageCheckpointScore: averageScore
+                        )
+                        if completion == nil || averageScore < completion!.averageCheckpointScore {
+                            completion = candidateCompletion
+                        }
+                    }
+                }
+
+                if completionGateOpen,
+                   track.nextCheckpointCursor >= checkpoints.count,
+                   let startedAt = track.startedAt,
+                   let completedAt = track.completedAt {
+                    let averageScore = track.scoreSum / Double(checkpoints.count)
+                    let candidateCompletion = StreamingPhaseCompletion(
+                        record: record,
+                        startedAt: startedAt,
+                        completedAt: completedAt,
+                        averageCheckpointScore: averageScore
+                    )
+                    if completion == nil || averageScore < completion!.averageCheckpointScore {
+                        completion = candidateCompletion
+                    }
+                }
+
+                let progress = Double(track.nextCheckpointCursor) / Double(checkpoints.count)
+                let confidence = Self.confidence(score: distance, threshold: threshold)
+                if progress > bestProgress || (progress == bestProgress && distance < bestScore) {
+                    bestProgress = progress
+                    bestConfidence = confidence
+                    bestScore = distance
+                    matchedTemplateIndex = template.index
+                    matchedTemplateSource = record.source
+                }
+
+                tracks[template.id] = track
+            }
+
+            if let completion {
+                bestProgress = 1
+                bestConfidence = max(bestConfidence, Self.confidence(score: completion.averageCheckpointScore, threshold: anchorThreshold))
+                bestScore = min(bestScore, completion.averageCheckpointScore)
+                matchedTemplateIndex = completion.record.template.index
+                matchedTemplateSource = completion.record.source
+            }
+
+            return StreamingPhaseResult(
+                progress: bestProgress,
+                confidence: bestConfidence,
+                bestScore: bestScore,
+                matchedTemplateIndex: matchedTemplateIndex,
+                matchedTemplateSource: matchedTemplateSource,
+                completion: completion
+            )
+        }
+
+        private static func checkpoints(for template: MovementTemplate) -> [Int] {
+            let maximumIndex = max(template.vectors.count - 1, 0)
+            let learned = template.phaseProfile.checkpointIndices
+                .filter { $0 >= 0 && $0 <= maximumIndex }
+            if learned.count >= 2 {
+                return learned
+            }
+            return [0, maximumIndex]
+        }
+
+        private static func threshold(
+            forCursor cursor: Int,
+            checkpointCount: Int,
+            template: MovementTemplate,
+            anchorThreshold: Double
+        ) -> Double {
+            let isTerminal = cursor == checkpointCount - 1
+            let isStart = cursor == 0
+            if isStart || isTerminal {
+                return max(min(anchorThreshold * 0.82, 0.18), 0.075)
+            }
+
+            switch template.phaseProfile.complexity {
+            case .simple:
+                return max(min(anchorThreshold * 1.8, 0.36), 0.16)
+            case .medium:
+                return max(min(anchorThreshold * 2.2, 0.46), 0.20)
+            case .complex:
+                return max(min(anchorThreshold * 1.15, 0.26), 0.105)
+            }
+        }
+
+        private static func timeout(for template: MovementTemplate) -> TimeInterval {
+            max(template.duration * 2.4, 2.5)
+        }
+
+        private static func didMoveEnoughSinceLastCheckpoint(
+            _ poseVector: PoseFeatureVector,
+            track: Track,
+            expectedCursor: Int,
+            checkpoints: [Int],
+            template: MovementTemplate,
+            anchorThreshold: Double
+        ) -> Bool {
+            guard expectedCursor > 0,
+                  let lastAcceptedVector = track.lastAcceptedVector
+            else {
+                return true
+            }
+
+            let movementSinceLastCheckpoint = poseVector.distance(
+                to: lastAcceptedVector,
+                limitedTo: FewShotRepetitionCounter.poseFeatureValueCount
+            )
+            let requiredMovement = minimumCheckpointStepDistance(
+                expectedCursor: expectedCursor,
+                checkpoints: checkpoints,
+                template: template,
+                anchorThreshold: anchorThreshold
+            )
+            return movementSinceLastCheckpoint >= requiredMovement
+        }
+
+        private static func minimumCheckpointStepDistance(
+            expectedCursor: Int,
+            checkpoints: [Int],
+            template: MovementTemplate,
+            anchorThreshold: Double
+        ) -> Double {
+            let previousIndex = checkpoints[max(expectedCursor - 1, 0)]
+            let currentIndex = checkpoints[min(expectedCursor, checkpoints.count - 1)]
+            let trainedStepDistance = template.vectors[currentIndex].distance(
+                to: template.vectors[previousIndex],
+                limitedTo: FewShotRepetitionCounter.poseFeatureValueCount
+            )
+            let floor = max(min(anchorThreshold * 0.16, 0.04), 0.018)
+            return max(min(trainedStepDistance * 0.28, 0.12), floor)
+        }
+
+        private static func confidence(score: Double, threshold: Double) -> Double {
+            guard score.isFinite else {
+                return 0
+            }
+            let ratio = score / max(threshold, 0.001)
+            return max(0, min(1, 1 - pow(ratio, 1.35)))
+        }
+    }
+
     private struct ScalarFeature {
         var value: Double
         var weight: Double
@@ -130,9 +444,17 @@ nonisolated final class FewShotRepetitionCounter {
         onlineTemplates.count
     }
 
+    var adaptiveCalibrationTemplateCount: Int {
+        calibrationTemplates.count
+    }
+
     func resetCount() {
         buffer.removeAll(keepingCapacity: true)
         pendingCompletion = nil
+        streamingPhaseCounter.reset()
+        phaseTracker.reset()
+        lastCompletionPoseVector = nil
+        hasExitedCompletionPoseSinceLastCount = true
         lastCountTimestamp = -.infinity
         repetitions = 0
         confidence = 0
@@ -144,12 +466,14 @@ nonisolated final class FewShotRepetitionCounter {
         depthMatchingEnabled = !Self.shouldDisableDepthMatching(for: loadedTemplates)
         self.templates = depthMatchingEnabled ? loadedTemplates : loadedTemplates.map(Self.templateWithoutDepthFeatures)
         onlineTemplates.removeAll(keepingCapacity: true)
+        calibrationTemplates.removeAll(keepingCapacity: true)
         anchorThreshold = Self.learnThreshold(from: self.templates)
         resetCount()
     }
 
     func clearOnlineTemplates() {
         onlineTemplates.removeAll(keepingCapacity: true)
+        calibrationTemplates.removeAll(keepingCapacity: true)
     }
 
     func makeTemplate(index: Int, frames: [PoseFrame], averageQuality: Double) -> MovementTemplate? {
@@ -166,7 +490,8 @@ nonisolated final class FewShotRepetitionCounter {
             duration: duration,
             qualityScore: averageQuality,
             vectors: weighted,
-            depthCoverage: Self.depthCoverage(in: weighted)
+            depthCoverage: Self.depthCoverage(in: weighted),
+            phaseProfile: Self.learnedPhaseProfile(for: weighted)
         )
     }
 
@@ -178,57 +503,75 @@ nonisolated final class FewShotRepetitionCounter {
                 bestScore: .infinity,
                 matchedTemplateIndex: nil,
                 matchedTemplateSource: nil,
-                onlineTemplateCount: onlineTemplateCount
+                onlineTemplateCount: onlineTemplateCount,
+                phaseProgress: 0,
+                pendingRepetition: false,
+                didCalibrateView: false
             )
         }
 
-        buffer.append(frame)
+        let currentPoseVector = Self.vector(from: frame)
+        buffer.append(BufferedPoseFrame(frame: frame, poseVector: currentPoseVector))
         trimBuffer(now: frame.timestamp)
         expirePendingCompletion(now: frame.timestamp)
-
-        let candidate = bestCandidate()
+        updateCompletionResetGate(with: currentPoseVector)
 
         let cooldownElapsed = frame.timestamp - lastCountTimestamp > completionCooldown
-        let immediateCandidate = immediateCompletionCandidate(
-            from: candidate,
-            currentFrame: frame,
-            cooldownElapsed: cooldownElapsed
+        let completionGateOpen = cooldownElapsed && hasExitedCompletionPoseSinceLastCount
+        let streamingResult = streamingPhaseCounter.update(
+            with: currentPoseVector,
+            at: frame.timestamp,
+            records: matchingTemplates,
+            anchorThreshold: anchorThreshold,
+            completionGateOpen: completionGateOpen
         )
-        let completedCandidate: Candidate?
-        if let immediateCandidate {
-            completedCandidate = immediateCandidate
-        } else {
-            if let candidate, candidate.score <= candidate.acceptanceThreshold, cooldownElapsed {
-                rememberPendingCompletion(candidate, now: frame.timestamp)
-            }
-            completedCandidate = completedPendingCandidate(with: frame)
-        }
+        let completedCandidate = terminalCompletionCandidate(
+            currentFrame: frame,
+            currentPoseVector: currentPoseVector,
+            completionGateOpen: completionGateOpen,
+            streamingProgress: streamingResult.progress,
+            streamingCompletion: streamingResult.completion
+        )
 
         let acceptedCompletedCandidate = completedCandidate.flatMap { candidate in
             completionConfidencePasses(candidate) ? candidate : nil
         }
-        if completedCandidate != nil, acceptedCompletedCandidate == nil {
-            pendingCompletion = nil
-        }
 
-        if let completedCandidate = acceptedCompletedCandidate, cooldownElapsed {
+        var didCalibrateView = false
+        let didCompleteRepetition = acceptedCompletedCandidate != nil && completionGateOpen
+        if let completedCandidate = acceptedCompletedCandidate, completionGateOpen {
             repetitions += 1
             lastCountTimestamp = frame.timestamp
+            lastCompletionPoseVector = currentPoseVector
+            hasExitedCompletionPoseSinceLastCount = false
+            didCalibrateView = promoteAdaptiveCalibrationTemplate(from: completedCandidate)
             promoteOnlineTemplate(from: completedCandidate)
             pendingCompletion = nil
+            streamingPhaseCounter.reset()
             buffer.removeAll(keepingCapacity: true)
         }
 
-        let displayedCandidate = acceptedCompletedCandidate ?? candidate
-        bestScore = displayedCandidate?.score ?? .infinity
-        confidence = confidence(for: displayedCandidate)
+        bestScore = acceptedCompletedCandidate?.score ?? streamingResult.bestScore
+        confidence = acceptedCompletedCandidate.map(confidence(for:)) ?? streamingResult.confidence
+        let rawPhaseProgress = streamingResult.progress
+        let hasMeaningfulProgressMotion = visibleProgressMotionPasses()
         return CountUpdate(
             repetitions: repetitions,
             confidence: confidence,
             bestScore: bestScore,
-            matchedTemplateIndex: displayedCandidate?.templateIndex,
-            matchedTemplateSource: displayedCandidate?.source,
-            onlineTemplateCount: onlineTemplateCount
+            matchedTemplateIndex: acceptedCompletedCandidate?.templateIndex ?? streamingResult.matchedTemplateIndex,
+            matchedTemplateSource: acceptedCompletedCandidate?.source ?? streamingResult.matchedTemplateSource,
+            onlineTemplateCount: onlineTemplateCount,
+            phaseProgress: displayedPhaseProgress(
+                rawProgress: rawPhaseProgress,
+                hasDisplayCandidate: streamingResult.progress > 0,
+                hasMeaningfulMotion: hasMeaningfulProgressMotion,
+                isCompletionPending: false,
+                didCompleteRepetition: didCompleteRepetition,
+                hasExitedCompletionPose: hasExitedCompletionPoseSinceLastCount
+            ),
+            pendingRepetition: false,
+            didCalibrateView: didCalibrateView
         )
     }
 
@@ -238,12 +581,62 @@ nonisolated final class FewShotRepetitionCounter {
         buffer.removeAll { now - $0.timestamp > window }
     }
 
-    private func bestCandidate() -> Candidate? {
+    private func updatePhaseTrackers(with frame: PoseFrame) -> PhaseProgressTracker.Signal? {
+        let expectedFrameCount = max(templates.map(\.sourceFrameCount).min() ?? sampleCount, 1)
+        return phaseTracker.update(frameCount: buffer.count, expectedFrameCount: expectedFrameCount)
+    }
+
+    private func displayedPhaseProgress(
+        rawProgress: Double,
+        hasDisplayCandidate: Bool,
+        hasMeaningfulMotion: Bool,
+        isCompletionPending: Bool,
+        didCompleteRepetition: Bool,
+        hasExitedCompletionPose: Bool
+    ) -> Double {
+        let clampedProgress = min(max(rawProgress, 0), 1)
+        if didCompleteRepetition {
+            return 0
+        }
+        if !hasExitedCompletionPose {
+            return 0
+        }
+        if !hasMeaningfulMotion && clampedProgress <= 0.34 {
+            return 0
+        }
+        if isCompletionPending || hasDisplayCandidate {
+            return min(clampedProgress, 0.96)
+        }
+        if hasMeaningfulMotion {
+            return min(clampedProgress, 0.85)
+        }
+        return 0
+    }
+
+    private func visibleProgressMotionPasses() -> Bool {
+        guard buffer.count >= 3 else {
+            return false
+        }
+
+        let recentFrameCount = min(buffer.count, 24)
+        let recentVectors = buffer.suffix(recentFrameCount).map(\.poseVector)
+        let recentMovement = Self.movementMagnitude(recentVectors)
+        let trainedMovement = templates
+            .map { Self.movementMagnitude($0.vectors) }
+            .min() ?? 0
+        let motionThreshold = max(min(trainedMovement * 0.18, 0.035), 0.01)
+        return recentMovement >= motionThreshold
+    }
+
+    private func bestCandidate(matching phaseSignal: PhaseProgressTracker.Signal?) -> Candidate? {
         guard buffer.count >= 18 else {
             return nil
         }
+        if phaseSignal != nil, let pendingCompletion {
+            return pendingCompletion.candidate
+        }
 
-        let bufferPoseVectors = buffer.map { Self.vector(from: $0) }
+        let bufferPoseVectors = buffer.map(\.poseVector)
         var best: Candidate?
 
         for record in matchingTemplates {
@@ -270,23 +663,30 @@ nonisolated final class FewShotRepetitionCounter {
                     continue
                 }
                 let candidateThreshold = acceptanceThreshold(for: record.source)
-                guard phaseGatePasses(comparableVectors, template: template, acceptanceThreshold: candidateThreshold) else {
+                guard Self.phaseGatePasses(comparableVectors, template: template, acceptanceThreshold: candidateThreshold) else {
+                    continue
+                }
+                let score = Self.distance(comparableVectors, template.vectors)
+                guard score <= max(candidateThreshold * 1.25, candidateThreshold + 0.05) else {
+                    continue
+                }
+                let candidateRank = score / max(candidateThreshold, 0.001)
+                let bestRank = best.map { $0.score / max($0.acceptanceThreshold, 0.001) } ?? .infinity
+                guard candidateRank < bestRank else {
                     continue
                 }
 
-                let anchorScore = closestAnchorScore(
-                    to: comparableVectors,
-                    duration: segmentDuration(segmentSlice),
-                    movement: candidateMovement
-                )
+                let anchorScore = record.source == .anchor
+                    ? Self.anchorPassThroughScore
+                    : closestAnchorScore(
+                        to: comparableVectors,
+                        duration: segmentDuration(segmentSlice),
+                        movement: candidateMovement
+                    )
 
                 guard record.source == .anchor || anchorCorroborates(anchorScore) else {
                     continue
                 }
-
-                let score = Self.distance(comparableVectors, template.vectors)
-                let candidateRank = score / max(candidateThreshold, 0.001)
-                let bestRank = best.map { $0.score / max($0.acceptanceThreshold, 0.001) } ?? .infinity
 
                 if candidateRank < bestRank {
                     best = Candidate(
@@ -295,7 +695,7 @@ nonisolated final class FewShotRepetitionCounter {
                         source: record.source,
                         template: template,
                         acceptanceThreshold: candidateThreshold,
-                        segment: Array(segmentSlice),
+                        segment: segmentSlice.map(\.frame),
                         vectors: comparableVectors,
                         anchorScore: anchorScore,
                         averageQuality: Self.averageJointConfidence(in: segmentSlice)
@@ -310,11 +710,15 @@ nonisolated final class FewShotRepetitionCounter {
     private var matchingTemplates: [TemplateRecord] {
         templates.map { TemplateRecord(template: $0, source: .anchor) }
             + onlineTemplates.map { TemplateRecord(template: $0.template, source: .online) }
+            + calibrationTemplates.map { TemplateRecord(template: $0, source: .calibration) }
     }
 
     private var completionCooldown: TimeInterval {
         let shortestTemplate = templates.map(\.duration).min() ?? 1.6
-        return max(1.1, shortestTemplate * 0.72)
+        if repetitions < conservativeCountGateRepetitionLimit {
+            return max(1.1, shortestTemplate * 0.55)
+        }
+        return max(0.45, shortestTemplate * 0.22)
     }
 
     private func acceptanceThreshold(for source: TemplateMatchSource) -> Double {
@@ -323,6 +727,8 @@ nonisolated final class FewShotRepetitionCounter {
             anchorThreshold
         case .online:
             onlineAcceptanceThreshold
+        case .calibration:
+            max(0.11, anchorThreshold * 0.82)
         }
     }
 
@@ -341,9 +747,8 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func completeLengthRange(for template: MovementTemplate, availableCount: Int) -> ClosedRange<Int>? {
-        let expectedFrames = max(template.sourceFrameCount, 20)
-        let lowerBound = max(Int((Double(expectedFrames) * 0.68).rounded(.down)), 20)
-        let upperBound = min(Int((Double(expectedFrames) * 1.85).rounded(.up)), availableCount)
+        let lowerBound = min(18, availableCount)
+        let upperBound = availableCount
 
         guard lowerBound <= upperBound else {
             return nil
@@ -352,10 +757,14 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func minimumCandidateDuration(for template: MovementTemplate) -> TimeInterval {
-        max(template.duration * 0.68, 0.55)
+        max(min(template.duration * 0.08, 0.25), 0.05)
     }
 
     private func segmentDuration(_ segment: [PoseFrame]) -> TimeInterval {
+        segmentDuration(segment[...])
+    }
+
+    private func segmentDuration(_ segment: [BufferedPoseFrame]) -> TimeInterval {
         segmentDuration(segment[...])
     }
 
@@ -366,8 +775,24 @@ nonisolated final class FewShotRepetitionCounter {
         return max(last.timestamp - first.timestamp, 0)
     }
 
+    private func segmentDuration(_ segment: ArraySlice<BufferedPoseFrame>) -> TimeInterval {
+        guard let first = segment.first, let last = segment.last else {
+            return 0
+        }
+        return max(last.timestamp - first.timestamp, 0)
+    }
+
     private func minimumCandidateMovement(for template: MovementTemplate) -> Double {
-        max(Self.movementMagnitude(template.vectors) * 0.35, 0.006)
+        let minimumFloor: Double
+        switch template.phaseProfile.complexity {
+        case .simple:
+            minimumFloor = 0.0015
+        case .medium:
+            minimumFloor = 0.0035
+        case .complex:
+            minimumFloor = 0.006
+        }
+        return max(Self.movementMagnitude(template.vectors) * 0.35, minimumFloor)
     }
 
     private func anchorCorroborates(_ anchorScore: Double) -> Bool {
@@ -381,7 +806,7 @@ nonisolated final class FewShotRepetitionCounter {
             return
         }
 
-        let expiresAt = now + max(0.75, candidate.template.duration * 0.35)
+        let expiresAt = now + max(0.35, candidate.template.duration * 0.12)
         guard let pendingCompletion else {
             self.pendingCompletion = PendingCompletion(candidate: candidate, expiresAt: expiresAt)
             return
@@ -399,19 +824,205 @@ nonisolated final class FewShotRepetitionCounter {
     private func immediateCompletionCandidate(
         from candidate: Candidate?,
         currentFrame frame: PoseFrame,
-        cooldownElapsed: Bool
+        completionGateOpen: Bool
     ) -> Candidate? {
         guard let candidate,
-              cooldownElapsed,
+              completionGateOpen,
               candidate.score <= candidate.acceptanceThreshold,
               completionCandidateHasEnoughCoverage(candidate),
               completionConfidencePasses(candidate),
-              candidateCompletesImmediately(candidate, with: frame)
+              terminalCompletionPasses(candidate, with: frame, requiresCandidateEndVector: true)
         else {
             return nil
         }
 
         return candidate
+    }
+
+    private func updateCompletionResetGate(with currentVector: PoseFeatureVector) {
+        guard !hasExitedCompletionPoseSinceLastCount,
+              let lastCompletionPoseVector
+        else {
+            return
+        }
+
+        let exitDistance = currentVector.distance(
+            to: lastCompletionPoseVector,
+            limitedTo: Self.poseFeatureValueCount
+        )
+        if exitDistance >= completionResetThreshold {
+            hasExitedCompletionPoseSinceLastCount = true
+        }
+    }
+
+    private func makeStreamingCompletionCandidate(from completion: StreamingPhaseCompletion) -> Candidate? {
+        var segment = buffer.filter { item in
+            item.timestamp >= completion.startedAt && item.timestamp <= completion.completedAt
+        }
+        if segment.count < 2 {
+            segment = Array(buffer.suffix(min(buffer.count, completion.record.template.sourceFrameCount)))
+        }
+        let template = completion.record.template
+        let requiredFrameCount = Int((Double(template.sourceFrameCount) * streamingCompletionCoverageRatio(for: template)).rounded(.up))
+        if segment.count < requiredFrameCount {
+            segment = Array(buffer.suffix(min(buffer.count, template.sourceFrameCount)))
+        }
+        guard segment.count >= 2 else {
+            return nil
+        }
+
+        guard segment.count >= max(requiredFrameCount, 2) else {
+            return nil
+        }
+
+        let segmentPoseVectors = segment.map(\.poseVector)
+        let segmentVectors = Self.featureVectors(fromPoseVectors: segmentPoseVectors[...])
+        let vectors = resample(segmentVectors, targetCount: sampleCount)
+        let comparableVectors = depthMatchingEnabled ? vectors : Self.withoutDepthFeatures(vectors)
+        guard comparableVectors.count == sampleCount else {
+            return nil
+        }
+
+        let candidateMovement = Self.movementMagnitude(comparableVectors)
+        let threshold = acceptanceThreshold(for: completion.record.source)
+        guard Self.phaseGatePasses(comparableVectors, template: template, acceptanceThreshold: threshold) else {
+            return nil
+        }
+        if template.phaseProfile.complexity == .complex {
+            let templateDepthMotion = Self.depthMotionMagnitude(template.vectors)
+            let candidateDepthMotion = Self.depthMotionMagnitude(comparableVectors)
+            if templateDepthMotion >= 0.01,
+               candidateDepthMotion < templateDepthMotion * 0.7 {
+                return nil
+            }
+        }
+        let templateDistance = Self.distance(comparableVectors, template.vectors)
+        let distanceLimit: Double
+        if template.phaseProfile.complexity == .complex {
+            distanceLimit = max(threshold * 0.42, threshold - 0.08)
+        } else {
+            distanceLimit = max(threshold * 1.4, threshold + 0.08)
+        }
+        guard templateDistance <= distanceLimit else {
+            return nil
+        }
+        let score = templateDistance
+
+        let anchorScore = completion.record.source == .anchor
+            ? Self.anchorPassThroughScore
+            : closestAnchorScore(
+                to: comparableVectors,
+                duration: segmentDuration(segment),
+                movement: candidateMovement
+            )
+        return Candidate(
+            score: score,
+            templateIndex: template.index,
+            source: completion.record.source,
+            template: template,
+            acceptanceThreshold: threshold,
+            segment: segment.map(\.frame),
+            vectors: comparableVectors,
+            anchorScore: anchorScore,
+            averageQuality: Self.averageJointConfidence(in: segment)
+        )
+    }
+
+    private func streamingCompletionCoverageRatio(for template: MovementTemplate) -> Double {
+        switch template.phaseProfile.complexity {
+        case .simple:
+            return 0.45
+        case .medium:
+            return 0.58
+        case .complex:
+            return 0.2
+        }
+    }
+
+    private var completionResetThreshold: Double {
+        max(min(anchorThreshold * 0.25, 0.08), 0.025)
+    }
+
+    private func terminalCompletionCandidate(
+        currentFrame frame: PoseFrame,
+        currentPoseVector: PoseFeatureVector,
+        completionGateOpen: Bool,
+        streamingProgress: Double,
+        streamingCompletion: StreamingPhaseCompletion?
+    ) -> Candidate? {
+        let primaryTemplate = matchingTemplates.first?.template
+        guard completionGateOpen,
+              streamingProgress >= completionProgressGate(for: primaryTemplate),
+              terminalPoseMatchesAnyTemplate(currentPoseVector)
+        else {
+            return nil
+        }
+
+        if matchingTemplates.first?.template.phaseProfile.complexity != .complex {
+            if let candidate = bestCandidate(matching: nil),
+               candidate.score <= candidate.acceptanceThreshold,
+               completionCandidateHasEnoughCoverage(candidate),
+               completionConfidencePasses(candidate),
+               terminalCompletionPasses(candidate, with: frame, requiresCandidateEndVector: true) {
+                return candidate
+            }
+        }
+
+        let synthesizedCompletion = streamingCompletion ?? matchingTemplates.first { record in
+            record.template.index == candidateMatchedTemplateIndex(fromProgress: streamingProgress)
+        }.map { record in
+            StreamingPhaseCompletion(
+                record: record,
+                startedAt: buffer.first?.timestamp ?? frame.timestamp,
+                completedAt: frame.timestamp,
+                averageCheckpointScore: 0
+            )
+        }
+
+        guard let synthesizedCompletion,
+              let streamingCandidate = makeStreamingCompletionCandidate(from: synthesizedCompletion)
+        else {
+            return nil
+        }
+
+        return streamingCandidate
+    }
+
+    private func completionProgressGate(for template: MovementTemplate?) -> Double {
+        switch template?.phaseProfile.complexity {
+        case .simple:
+            return 0.95
+        case .medium:
+            return 0.95
+        case .complex:
+            return 0.98
+        case nil:
+            return 0.9
+        }
+    }
+
+    private func candidateMatchedTemplateIndex(fromProgress progress: Double) -> Int? {
+        guard progress >= 1 else {
+            return nil
+        }
+        return matchingTemplates.first?.template.index
+    }
+
+    private func terminalPoseMatchesAnyTemplate(_ currentPoseVector: PoseFeatureVector) -> Bool {
+        matchingTemplates.contains { record in
+            guard let endVector = record.template.vectors.last else {
+                return false
+            }
+            let distance = currentPoseVector.distance(
+                to: endVector,
+                limitedTo: Self.poseFeatureValueCount
+            )
+            return distance <= completionPoseThreshold(for: record.template)
+        }
+    }
+
+    private func shouldRunFallbackVerifier(candidate: Candidate?) -> Bool {
+        candidate == nil || pendingCompletion != nil
     }
 
     private func completionConfidencePasses(_ candidate: Candidate) -> Bool {
@@ -420,9 +1031,29 @@ nonisolated final class FewShotRepetitionCounter {
 
     private func completedPendingCandidate(with frame: PoseFrame) -> Candidate? {
         guard let pendingCompletion else { return nil }
-        guard completionPoseMatches(frame, candidate: pendingCompletion.candidate) else { return nil }
-        guard completionPoseIsStable() else { return nil }
+        guard terminalCompletionPasses(pendingCompletion.candidate, with: frame, requiresCandidateEndVector: false) else { return nil }
         return pendingCompletion.candidate
+    }
+
+    private func terminalCompletionPasses(
+        _ candidate: Candidate,
+        with frame: PoseFrame,
+        requiresCandidateEndVector: Bool
+    ) -> Bool {
+        guard completionPoseMatches(frame, candidate: candidate) else {
+            return false
+        }
+        if requiresCandidateEndVector,
+           !candidateCompletesImmediately(candidate, with: frame) {
+            return false
+        }
+        if completionPoseIsStable() {
+            return true
+        }
+        if candidate.template.phaseProfile.complexity == .complex {
+            return true
+        }
+        return candidate.segment.count >= min(candidate.template.sourceFrameCount, sampleCount)
     }
 
     private func candidateCompletesImmediately(_ candidate: Candidate, with frame: PoseFrame) -> Bool {
@@ -446,7 +1077,21 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func completionCandidateHasEnoughCoverage(_ candidate: Candidate) -> Bool {
-        segmentDuration(candidate.segment) >= max(candidate.template.duration * 0.74, 0.65)
+        candidate.segment.count >= minimumTerminalCandidateFrameCount(for: candidate.template)
+    }
+
+    private func minimumTerminalCandidateFrameCount(for template: MovementTemplate) -> Int {
+        let coverageRatio: Double
+        if template.phaseProfile.complexity == .complex {
+            coverageRatio = complexCompletionCoverageRatio
+        } else if repetitions < conservativeCountGateRepetitionLimit {
+            coverageRatio = conservativeCompletionCoverageRatio
+        } else {
+            coverageRatio = relaxedCompletionCoverageRatio
+        }
+        let requiredFrameCount = Int((Double(template.sourceFrameCount) * coverageRatio).rounded(.up))
+        let minimumFloor = template.phaseProfile.complexity == .complex ? 18 : 24
+        return min(max(requiredFrameCount, minimumFloor), sampleCount)
     }
 
     private func completionPoseMatches(_ frame: PoseFrame, candidate: Candidate) -> Bool {
@@ -460,7 +1105,7 @@ nonisolated final class FewShotRepetitionCounter {
         let recentFrames = Array(buffer.suffix(3))
         guard recentFrames.count >= 2 else { return false }
 
-        let vectors = recentFrames.map(Self.vector)
+        let vectors = recentFrames.map(\.poseVector)
         let largestStep = zip(vectors, vectors.dropFirst()).map { pair in
             pair.0.distance(to: pair.1, limitedTo: Self.poseFeatureValueCount)
         }.max() ?? .infinity
@@ -469,13 +1114,10 @@ nonisolated final class FewShotRepetitionCounter {
     }
 
     private func completionPoseThreshold(for template: MovementTemplate) -> Double {
-        let endpointDrift = template.vectors.first.map { firstVector in
-            firstVector.distance(to: template.vectors.last ?? firstVector, limitedTo: Self.poseFeatureValueCount)
-        } ?? 0
-        return max(min(anchorThreshold * 1.2, 0.24), endpointDrift + 0.08)
+        max(min(anchorThreshold * 0.85, 0.18), 0.08)
     }
 
-    private func phaseGatePasses(
+    private static func phaseGatePasses(
         _ vectors: [PoseFeatureVector],
         template: MovementTemplate,
         acceptanceThreshold: Double
@@ -484,13 +1126,9 @@ nonisolated final class FewShotRepetitionCounter {
             return false
         }
 
-        let checkpoints = [
-            0,
-            vectors.count / 4,
-            vectors.count / 2,
-            (vectors.count * 3) / 4,
-            vectors.count - 1
-        ]
+        let checkpoints = template.phaseProfile.checkpointIndices.isEmpty
+            ? Self.phaseCheckpointIndices(for: vectors)
+            : template.phaseProfile.checkpointIndices
 
         let poseThreshold = max(min(acceptanceThreshold * 1.55, 0.34), 0.14)
         let middleThreshold = max(min(acceptanceThreshold * 1.9, 0.42), 0.18)
@@ -498,8 +1136,9 @@ nonisolated final class FewShotRepetitionCounter {
             to: template.vectors[checkpoints[0]],
             limitedTo: Self.poseFeatureValueCount
         )
-        let endDistance = vectors[checkpoints[4]].distance(
-            to: template.vectors[checkpoints[4]],
+        let endCheckpoint = checkpoints.last ?? (vectors.count - 1)
+        let endDistance = vectors[endCheckpoint].distance(
+            to: template.vectors[endCheckpoint],
             limitedTo: Self.poseFeatureValueCount
         )
 
@@ -507,14 +1146,22 @@ nonisolated final class FewShotRepetitionCounter {
             return false
         }
 
-        let middlePassCount = checkpoints[1...3].filter { checkpoint in
+        let middleCheckpoints = checkpoints.dropFirst().dropLast()
+        let middlePassCount = middleCheckpoints.filter { checkpoint in
             vectors[checkpoint].distance(
                 to: template.vectors[checkpoint],
                 limitedTo: Self.poseFeatureValueCount
             ) <= middleThreshold
         }.count
 
-        guard middlePassCount >= 2 else {
+        let requiredMiddlePassCount: Int
+        if template.phaseProfile.complexity == .complex {
+            requiredMiddlePassCount = max(min(middleCheckpoints.count, middleCheckpoints.count - 1), 3)
+        } else {
+            requiredMiddlePassCount = min(3, middleCheckpoints.count)
+        }
+
+        guard middlePassCount >= requiredMiddlePassCount else {
             return false
         }
 
@@ -522,8 +1169,170 @@ nonisolated final class FewShotRepetitionCounter {
             return false
         }
 
-        let velocityDistance = Self.distance(vectors, template.vectors)
-        return velocityDistance <= max(acceptanceThreshold * 1.25, acceptanceThreshold + 0.05)
+        return true
+    }
+
+    private static func phaseCheckpointIndices(for vectors: [PoseFeatureVector]) -> [Int] {
+        phaseCheckpointIndices(for: vectors, complexity: .complex)
+    }
+
+    private static func learnedPhaseProfile(for vectors: [PoseFeatureVector]) -> MovementPhaseProfile {
+        let complexity = movementComplexity(for: vectors)
+        return MovementPhaseProfile(
+            checkpointIndices: phaseCheckpointIndices(for: vectors, complexity: complexity),
+            complexity: complexity
+        )
+    }
+
+    private static func phaseCheckpointIndices(
+        for vectors: [PoseFeatureVector],
+        complexity: MovementComplexity
+    ) -> [Int] {
+        guard vectors.count >= 7 else {
+            return [0, max(vectors.count - 1, 0)]
+        }
+
+        switch complexity {
+        case .simple:
+            return [0, vectors.count / 2, vectors.count - 1]
+        case .medium:
+            return [
+                0,
+                vectors.count / 4,
+                vectors.count / 2,
+                (vectors.count * 3) / 4,
+                vectors.count - 1
+            ]
+        case .complex:
+            break
+        }
+
+        return [
+            0,
+            vectors.count / 6,
+            vectors.count / 3,
+            vectors.count / 2,
+            (vectors.count * 2) / 3,
+            (vectors.count * 5) / 6,
+            vectors.count - 1
+        ]
+    }
+
+    private static func movementComplexity(for vectors: [PoseFeatureVector]) -> MovementComplexity {
+        let signalStats = movementSignalStats(for: vectors)
+        let activeSignalCount = signalStats.filter { $0.range >= 0.05 }.count
+        let highMotionSignalCount = signalStats.filter { $0.range >= 0.12 }.count
+        let movingRegionCount = movingBodyRegionCount(signalStats)
+        let directionChangeCount = signalStats
+            .sorted { $0.range > $1.range }
+            .prefix(10)
+            .reduce(0) { partial, stats in
+                partial + min(stats.directionChanges, 2)
+            }
+
+        if movingRegionCount <= 2,
+           highMotionSignalCount <= 14,
+           directionChangeCount <= 10 {
+            return .simple
+        }
+
+        if movingRegionCount >= 4 || activeSignalCount >= 22 || directionChangeCount >= 13 {
+            return .complex
+        }
+
+        return .medium
+    }
+
+    private struct MovementSignalStats {
+        var index: Int
+        var range: Double
+        var directionChanges: Int
+    }
+
+    private static func movementSignalStats(for vectors: [PoseFeatureVector]) -> [MovementSignalStats] {
+        guard vectors.count > 2 else { return [] }
+        let featureCount = min(poseFeatureValueCount, vectors.map(\.values.count).min() ?? 0)
+        guard featureCount > 0 else { return [] }
+
+        return (0..<featureCount).compactMap { index in
+            let weightedValues = vectors.compactMap { vector -> Double? in
+                guard index < vector.values.count,
+                      index < vector.weights.count,
+                      vector.weights[index] > 0.2
+                else {
+                    return nil
+                }
+                return vector.values[index]
+            }
+            guard weightedValues.count >= 3,
+                  let minimum = weightedValues.min(),
+                  let maximum = weightedValues.max()
+            else {
+                return nil
+            }
+
+            return MovementSignalStats(
+                index: index,
+                range: maximum - minimum,
+                directionChanges: directionChanges(in: weightedValues, noiseFloor: 0.015)
+            )
+        }
+    }
+
+    private static func directionChanges(in values: [Double], noiseFloor: Double) -> Int {
+        guard values.count > 2 else { return 0 }
+        var previousDirection = 0
+        var changes = 0
+
+        for (previous, current) in zip(values, values.dropFirst()) {
+            let delta = current - previous
+            let direction: Int
+            if delta > noiseFloor {
+                direction = 1
+            } else if delta < -noiseFloor {
+                direction = -1
+            } else {
+                continue
+            }
+
+            if previousDirection != 0, direction != previousDirection {
+                changes += 1
+            }
+            previousDirection = direction
+        }
+
+        return changes
+    }
+
+    private static func movingBodyRegionCount(_ signalStats: [MovementSignalStats]) -> Int {
+        var regions: Set<Int> = []
+        for stats in signalStats where stats.range >= 0.08 {
+            if let region = bodyRegion(forFeatureIndex: stats.index) {
+                regions.insert(region)
+            }
+        }
+        return regions.count
+    }
+
+    private static func bodyRegion(forFeatureIndex index: Int) -> Int? {
+        guard index < rawPoseFeatureValueCount else {
+            return nil
+        }
+        let jointIndex = index / 3
+        switch jointOrder[jointIndex] {
+        case .leftShoulder, .rightShoulder:
+            return 0
+        case .leftElbow, .rightElbow, .leftWrist, .rightWrist:
+            return 1
+        case .leftHip, .rightHip:
+            return 2
+        case .leftKnee, .rightKnee:
+            return 3
+        case .leftAnkle, .rightAnkle:
+            return 4
+        case .nose, .neck, .root:
+            return 5
+        }
     }
 
     private func closestAnchorScore(
@@ -534,11 +1343,6 @@ nonisolated final class FewShotRepetitionCounter {
         var closest = Double.infinity
 
         for template in templates {
-            let durationRatio = duration / max(template.duration, 0.1)
-            guard (0.62...1.85).contains(durationRatio) else {
-                continue
-            }
-
             let templateMovement = Self.movementMagnitude(template.vectors)
             guard movement >= max(templateMovement * 0.35, 0.006) else {
                 continue
@@ -575,6 +1379,38 @@ nonisolated final class FewShotRepetitionCounter {
         evictWeakOnlineTemplatesIfNeeded()
     }
 
+    private func promoteAdaptiveCalibrationTemplate(from candidate: Candidate) -> Bool {
+        guard calibrationTemplates.isEmpty else {
+            return false
+        }
+        guard let template = makeCalibrationTemplate(from: candidate) else {
+            return false
+        }
+
+        calibrationTemplates.append(template)
+        return true
+    }
+
+    private func makeCalibrationTemplate(from candidate: Candidate) -> MovementTemplate? {
+        guard candidate.vectors.count == sampleCount, !candidate.segment.isEmpty else {
+            return nil
+        }
+
+        let weighted = Self.applyFeatureVarianceWeights(candidate.vectors)
+        let vectors = depthMatchingEnabled ? weighted : Self.withoutDepthFeatures(weighted)
+        let duration = segmentDuration(candidate.segment)
+        return MovementTemplate(
+            index: nextOnlineTemplateIndex + calibrationTemplates.count,
+            capturedAt: Date(),
+            sourceFrameCount: candidate.segment.count,
+            duration: max(duration, 0.1),
+            qualityScore: candidate.averageQuality,
+            vectors: vectors,
+            depthCoverage: Self.depthCoverage(in: vectors),
+            phaseProfile: Self.learnedPhaseProfile(for: vectors)
+        )
+    }
+
     private var nextOnlineTemplateIndex: Int {
         let highestAnchorIndex = templates.map(\.index).max() ?? 0
         let highestOnlineIndex = onlineTemplates.map(\.template.index).max() ?? highestAnchorIndex
@@ -603,7 +1439,8 @@ nonisolated final class FewShotRepetitionCounter {
             duration: max(duration, 0.1),
             qualityScore: candidate.averageQuality,
             vectors: vectors,
-            depthCoverage: Self.depthCoverage(in: vectors)
+            depthCoverage: Self.depthCoverage(in: vectors),
+            phaseProfile: Self.learnedPhaseProfile(for: vectors)
         )
     }
 
@@ -990,7 +1827,7 @@ nonisolated final class FewShotRepetitionCounter {
 
         for index in 0..<valueCount {
             values.append(current.values[index] - previous.values[index])
-            weights.append(min(previous.weights[index], current.weights[index]) * 0.55)
+            weights.append(min(previous.weights[index], current.weights[index]) * 0.18)
         }
 
         while values.count < poseFeatureValueCount {
@@ -1138,9 +1975,21 @@ nonisolated final class FewShotRepetitionCounter {
         averageJointConfidence(in: segment[...])
     }
 
+    private static func averageJointConfidence(in segment: [BufferedPoseFrame]) -> Double {
+        averageJointConfidence(in: segment[...])
+    }
+
     private static func averageJointConfidence(in segment: ArraySlice<PoseFrame>) -> Double {
         let confidences = segment.flatMap { frame in
             frame.joints.values.map(\.confidence)
+        }
+        guard !confidences.isEmpty else { return 0 }
+        return confidences.reduce(0, +) / Double(confidences.count)
+    }
+
+    private static func averageJointConfidence(in segment: ArraySlice<BufferedPoseFrame>) -> Double {
+        let confidences = segment.flatMap { item in
+            item.frame.joints.values.map(\.confidence)
         }
         guard !confidences.isEmpty else { return 0 }
         return confidences.reduce(0, +) / Double(confidences.count)

@@ -2,6 +2,17 @@ import AVFoundation
 import Foundation
 import Speech
 
+private enum VoiceCommandAudioError: LocalizedError {
+    case invalidInputFormat
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidInputFormat:
+            "The microphone did not provide a valid audio format."
+        }
+    }
+}
+
 @MainActor
 final class VoiceCommandListener {
     enum Command: Hashable {
@@ -19,6 +30,8 @@ final class VoiceCommandListener {
     private let recognitionTimeoutSeconds: Int64 = 15
     private var timeoutTask: Task<Void, Never>?
     private var voiceSessionID = UUID()
+    private static let actionCommandWords: Set<String> = ["action"]
+    private static let stopCommandWords: Set<String> = ["stop", "finish", "done", "save"]
 
     func start(
         listeningFor allowedCommands: Set<Command>,
@@ -116,6 +129,9 @@ final class VoiceCommandListener {
 
             let inputNode = audioEngine.inputNode
             let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard Self.isValidInputFormat(inputFormat) else {
+                throw VoiceCommandAudioError.invalidInputFormat
+            }
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak request] buffer, _ in
                 request?.append(buffer)
             }
@@ -201,11 +217,11 @@ final class VoiceCommandListener {
     }
 
     private static func containsActionCommand(in transcript: String) -> Bool {
-        commandWords(in: transcript).contains("action")
+        commandWords(in: transcript).contains { actionCommandWords.contains($0) }
     }
 
     private static func containsStopCommand(in transcript: String) -> Bool {
-        commandWords(in: transcript).contains("stop")
+        commandWords(in: transcript).contains { stopCommandWords.contains($0) }
     }
 
     private static func commandWords(in transcript: String) -> [String] {
@@ -234,6 +250,10 @@ final class VoiceCommandListener {
         case .stop:
             "Stop heard"
         }
+    }
+
+    private static func isValidInputFormat(_ format: AVAudioFormat) -> Bool {
+        format.sampleRate > 0 && format.channelCount > 0
     }
 
     private static func requestSpeechAuthorization() async -> Bool {

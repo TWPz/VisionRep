@@ -95,6 +95,12 @@ for frame in slowRep.suffix(4) {
 expect(latest.repetitions == 1, "slower complete live rep should count on the final action frame without waiting for held end-pose frames")
 expect(counter.onlineTemplateCount == 1, "completed counted rep should still be available for online adaptation")
 
+for frame in holdEndPose(after: slowRep, count: 48) {
+    latest = counter.update(with: frame)
+}
+
+expect(latest.repetitions == 1, "holding the completed pose after a rep must not count extra repetitions")
+
 let secondRep = makeRep(start: 120, frameCount: 36, amplitude: 8.0)
 for frame in secondRep {
     latest = counter.update(with: frame)

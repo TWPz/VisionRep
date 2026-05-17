@@ -41,7 +41,7 @@ nonisolated final class ExerciseProfileStore: @unchecked Sendable {
     private func templatesURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
-        return base.appending(path: "VisionRep", directoryHint: .isDirectory)
+        return base.appending(path: "MPiPE", directoryHint: .isDirectory)
             .appending(path: fileName, directoryHint: .notDirectory)
     }
 }
